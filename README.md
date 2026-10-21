@@ -17,14 +17,16 @@ Two runs of the same scripted race, 18 seconds in. The cars take slightly differ
 because the physics is not identical between runs. The native side is missing the car's rear
 spoiler, a known bug.
 
-## Summary (2026-10-21)
+## Summary (2026-10-22)
 
-Measured on an i9-13900K with an RTX 3090, St Petersburg street race, uncapped, same build for
-every row.
+Measured on an i9-13900K with an RTX 3090, St Petersburg street race, uncapped. Within each row
+both columns come from the same build. The first row is the current build; the others were
+measured on 2026-10-21 before the recompiler changes below.
 
 | | Native renderer | Xenos plugin |
 |---|---|---|
-| Windows, release flags | **143 fps** with the render thread | 126 fps |
+| Windows, release flags | **166 fps** with the render thread | 125 fps |
+| Windows, release flags, 2026-10-21 build | 143 fps with the render thread | 126 fps |
 | Windows, debug decoder on | 129 fps with the render thread, 96 fps without | 126 fps |
 | Linux, Proton, debug decoder on | 112-116 fps with the render thread, 91-92 fps without | 113-114 fps |
 | Proton, 8 efficiency cores, debug decoder on | 80 fps with the render thread, 57 fps without | 72 fps |
@@ -32,15 +34,15 @@ every row.
 | Race image against the Xenos plugin | 31-33 dB PSNR | reference |
 
 The debug decoder is `--pgr4_d3d_tap`, which decodes the game's command buffer at every D3D call
-for traces and checks. Most measurements below were taken with it on, and it costs the native
-path about 0.8 ms per frame. With it off, native with the render thread takes 12.6 % less time
-per frame than the Xenos plugin (see [Windows](#windows)).
+for traces and checks. It costs the native path about 0.8 ms per frame. With it off, native with
+the render thread takes 25 % less time per frame than the Xenos plugin on the current build
+(6.02 against 8.02 ms, see [Windows](#windows)).
 
 - Title screen, menus and the St Petersburg race render. That route is the only one tested.
 - The car's rear spoiler is missing.
-- The render thread (`--pgr4_native_render_thread`) is on by default. In one race image check
-  out of three it draws some wrong geometry (see [Image accuracy](#image-accuracy)); set it to
-  `false` for the slower single-thread path.
+- The render thread (`--pgr4_native_render_thread`) is on by default. Its wrong-geometry bug is
+  fixed: the game thread and the render thread shared one list of pending vertex copies, so
+  copies could be lost or reordered. Nine race captures since the fix are all 30.8 to 32.7 dB.
 - Not run on a Steam Deck yet.
 - The game runs at 30 fps by default; MTR-PGR4's `--pgr4_60fps` makes it 60, which has not been
   tried with this renderer yet. The uncapped numbers above measure how much headroom there is.
@@ -56,13 +58,20 @@ per frame than the Xenos plugin (see [Windows](#windows)).
   two cores busy. The native renderer starts from the D3D calls and costs about 0.9 µs of CPU
   per draw. With the render thread, that work moves off the game thread onto a second thread
   that is about 43 % busy.
-- The game's own code takes about 8 ms per frame on the 13900K. That sets the floor for both
-  renderers.
+- The game's own code sets the floor for both renderers. Turning on ReXGlue's register-as-local
+  codegen options (`cr`, `ctr`, `xer`, `non_volatile` and `reserved_as_local`) keeps guest
+  registers in C++ locals instead of the context struct in memory. That took the native race
+  from 7.02 to 5.74 ms per frame, 17.9 % less (paired A/B, 95 % interval 14.2 to 21.6 %). The
+  Xenos plugin did not get faster, because its command-processing thread is the limit there
+  (98 % of a core). `native/build.ps1` explains why `skip_lr`, `skip_msr` and
+  `non_argument_as_local` stay off for this game.
 - Part of that floor is the game's D3D library. Each hook calls the original D3D function
-  first, and that function still builds the command buffer the Xenos plugin would read. In a
-  profiled race run (`guest_d3d` stage, render thread off) this took 1.47 ms of a 9.27 ms frame.
-  UnleashedRecomp and MarathonRecomp replace those functions instead of calling them, and
-  doing the same here is the largest saving left on the game thread.
+  first, and that function still builds the command buffer the Xenos plugin would read.
+  UnleashedRecomp and MarathonRecomp replace those functions instead of calling them. The first
+  piece of that is here behind `--pgr4_native_replace_draws` (off by default): in primary mode
+  DrawIndexedVertices, 91-98 % of the game's draws, no longer builds command packets. On the same
+  exe it took frame time from 6.08 to 5.55 ms, 8.5 % less (95 % interval 2.5 to 14.4 %). It
+  stays off until a race image check with it on is clean.
 
 ## Performance
 

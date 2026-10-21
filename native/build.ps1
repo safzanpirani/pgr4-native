@@ -176,6 +176,18 @@ if (Want 'game') {
         $gamePath = $Game.Replace('\', '/')
         $content = $content -replace 'game_root = "[^"]*"', ('game_root = "' + $gamePath + '"')
         $content = $content -replace 'file_path = "[^"]*"', ('file_path = "' + $gamePath + '/default.xex"')
+        # Register-as-local codegen (perf plan slice 0, rule 17 in the pgr4-native skill's
+        # native-renderer-performance.md): guest CR, CTR, XER and the non-volatile registers become
+        # C++ locals instead of PPCContext fields, and the register save/restore helpers vanish.
+        # Arguments and r1 stay in ctx. Same four options as prototype-switch on ReXGlue; skip_msr
+        # and reserved_as_local stay off.
+        if ($content -match '(?m)^\s*(cr|ctr|xer|non_volatile|non_argument|reserved)_as_local\s*=') {
+            throw 'the MTR manifest already sets *_as_local; merge by hand'
+        }
+        $locals = "cr_as_local = true`nctr_as_local = true`nxer_as_local = true`nnon_volatile_as_local = true`n"
+        $entry = [regex]::Match($content, '(?m)^\[entrypoint\]\r?\n')
+        if (-not $entry.Success) { throw 'pgr4_recompiled_manifest.toml: [entrypoint] not found' }
+        $content = $content.Insert($entry.Index + $entry.Length, $locals)
         [IO.File]::WriteAllText($manifest, $content, (New-Object Text.UTF8Encoding($false)))
         $stamp = Join-Path $Repo 'generated\default\codegen.build.stamp'
         if ($Force -and (Test-Path $stamp)) { Remove-Item $stamp }
@@ -184,6 +196,14 @@ if (Want 'game') {
             & $rexglue codegen $manifest
             if ($LASTEXITCODE -ne 0) { throw 'codegen failed' }
         } finally { Pop-Location }
+        # MTR's tools\apply_game_patches.ps1 (run by the game build) matches generated C++ text that
+        # names these registers ctx.r31, ctx.cr6, ctx.ctr. With the options above they are locals
+        # (r31, cr6, ctr), so rewrite the copy's patterns. prep restores MTR's original each time.
+        # A pattern that still finds nothing fails the build in the patch script itself.
+        $patcher = Join-Path $Repo 'tools\apply_game_patches.ps1'
+        $ptext = [IO.File]::ReadAllText($patcher)
+        $plocal = [regex]::Replace($ptext, '\bctx\.(r1[4-9]|r2[0-9]|r3[01]|f1[4-9]|f2[0-9]|f3[01]|cr[0-7]|ctr|xer)\b', '$1')
+        if ($plocal -ne $ptext) { [IO.File]::WriteAllText($patcher, $plocal, (New-Object Text.UTF8Encoding($false))) }
         $build = Join-Path $Repo 'out\pgr4'
         & cmake -S $Repo -B $build -G Ninja -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_BUILD_TYPE=Release `
             "-DCMAKE_PREFIX_PATH=$Sdk" "-DMTR_GAME_MANIFEST=$manifest"

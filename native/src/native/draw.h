@@ -27,7 +27,11 @@
 // Not handled (counted in Stats and skipped): memexport, tessellation, host-converted index
 // buffers (triangle fans, line loops, primitive reset with an index other than 0xFFFF).
 //
-// Threading: the renderer's On* calls only (one guest thread).
+// Threading: the renderer's On* calls only (one guest thread). With the render thread
+// (renderer.h, --pgr4_native_render_thread) the work is split: Prepare and EndFramePrepare run
+// on the guest thread at the draw's call (shader lookup, vertex/index copies out of guest
+// memory, which the game may rewrite right after the draw); everything else runs on the
+// render thread, later, from the DrawPrep the hook side made.
 #pragma once
 
 #include "d3d12_device.h"
@@ -35,10 +39,35 @@
 
 #include <cstdint>
 #include <memory>
+#include <vector>
+
+namespace rex::graphics {
+class DxbcShader;
+}
 
 namespace pgr4::native {
 
 class NativeRenderer;
+
+// Guest memory copied into upload memory, to be copied into shared memory at `dst`.
+struct VertexCopy {
+  ID3D12Resource* src;
+  uint64_t src_offset;
+  uint32_t dst, size;
+};
+
+// The guest-thread half of one draw (DrawRenderer::Prepare).
+struct DrawPrep {
+  rex::graphics::DxbcShader* vs = nullptr;  // nullptr: no vertex shader (the draw is dropped)
+  rex::graphics::DxbcShader* ps = nullptr;
+  bool upload_ok = true;                    // every vertex/index range was copied
+  const VertexCopy* copies = nullptr;       // set by the render side before OnDraw
+  uint32_t copy_count = 0;
+  // Triangle fans: the converted host indices in upload memory.
+  D3D12_GPU_VIRTUAL_ADDRESS fan_indices = 0;
+  uint32_t fan_count = 0;
+  bool fan_wide = false;
+};
 
 class DrawRenderer {
  public:
@@ -66,7 +95,21 @@ class DrawRenderer {
   bool Initialize();
 
   // After a successful ReadDrawState for the draw. Records into renderer.command_list().
-  void OnDraw(const uint8_t* base, const DrawState& state);
+  // `prep` (render thread): what Prepare made for this draw on the guest thread.
+  void OnDraw(const uint8_t* base, const DrawState& state, const DrawPrep* prep = nullptr);
+
+  // Guest thread, render thread mode: shader lookup and vertex/index copies for `state` (whose
+  // regs are the tracker's, current). Copies go to the end of `copies`; upload memory is
+  // tagged with `upload_tag` (EndFramePrepare's units).
+  void Prepare(const DrawState& state, uint64_t upload_tag, DrawPrep* prep,
+               std::vector<VertexCopy>* copies);
+  // Guest thread, once per Swap: recycles vertex upload memory with tags <= `done`. Returns
+  // Prepare's upload counters since the previous call (added to stats() by AddUploads).
+  void EndFramePrepare(uint64_t done, uint64_t* upload_bytes, uint64_t* uploads);
+  void AddUploads(uint64_t upload_bytes, uint64_t uploads) {
+    stats_.upload_bytes += upload_bytes;
+    stats_.uploads += uploads;
+  }
 
   // Something else set graphics/compute state or descriptor heaps on the command list (the
   // Resolver does): set everything again at the next draw. A new frame's list is detected

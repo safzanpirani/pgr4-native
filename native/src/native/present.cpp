@@ -201,7 +201,7 @@ struct Presenter::Impl {
   explicit Impl(NativeRenderer& renderer) : r(renderer) {}
 
   bool Initialize();
-  bool CaptureRequested();
+  bool CaptureRequested(uint64_t frame);
   void FinishCapture(const uint8_t* base);
 };
 
@@ -267,10 +267,10 @@ bool Presenter::Impl::Initialize() {
   return true;
 }
 
-bool Presenter::Impl::CaptureRequested() {
+bool Presenter::Impl::CaptureRequested(uint64_t frame) {
   bool want = false;
   const int32_t at = REXCVAR_GET(pgr4_native_capture_frame);
-  if (at >= 0 && r.frame_index() == uint64_t(at)) want = true;
+  if (at >= 0 && frame == uint64_t(at)) want = true;
   if (GetAsyncKeyState(VK_F12) & 1) want = true;
   std::filesystem::path req = std::filesystem::path(REXCVAR_GET(pgr4_native_capture_dir)) /
                               "capture.request";
@@ -357,18 +357,26 @@ Presenter::~Presenter() = default;
 
 bool Presenter::Initialize() { return impl_->Initialize(); }
 
-void Presenter::OnSwap(const uint8_t* base, const HookArgs& args) {
+bool Presenter::CaptureRequested(uint64_t frame) { return impl_->CaptureRequested(frame); }
+
+void Presenter::ReadSwap(const uint8_t* base, const HookArgs& args, SwapCall* out) {
+  // The front buffer texture's fetch constant (D3DBaseTexture + 28).
+  out->texture = args.r[1];
+  if (out->texture)
+    for (int i = 0; i < 6; ++i) out->fetch[i] = Load32(base, out->texture + 28 + 4 * i);
+}
+
+void Presenter::OnSwap(const SwapCall& swap) {
   Impl& m = *impl_;
   D3D12Device& d = renderer_.device();
   ID3D12GraphicsCommandList* list = d.command_list();
   ID3D12Device* device = renderer_.d3d12();
 
-  // The front buffer texture's fetch constant (D3DBaseTexture + 28).
-  const uint32_t tex = args.r[1];
+  const uint32_t tex = swap.texture;
   uint32_t fetch[6] = {};
   const ResolvedImage* image = nullptr;
   if (tex) {
-    for (int i = 0; i < 6; ++i) fetch[i] = Load32(base, tex + 28 + 4 * i);
+    std::memcpy(fetch, swap.fetch, sizeof(fetch));
     // The object holds the D3D's virtual address; the GPU (and the Resolver) use the physical
     // one: low 29 bits, plus 4 KiB for the 0xE0000000 view (as the D3D converts it).
     const uint32_t a = fetch[1] & 0xFFFFF000u;
@@ -448,7 +456,8 @@ void Presenter::OnSwap(const uint8_t* base, const HookArgs& args) {
   // A request arms the capture of the next frame: its resolves must reach guest memory
   // synchronously (HoldFullReadback), or the Xenos copy is the previous frame's.
   if (!m.capture.armed) {
-    if (m.CaptureRequested()) {
+    if (swap.capture_request < 0 ? m.CaptureRequested(renderer_.frame_index())
+                                 : swap.capture_request > 0) {
       HoldFullReadback(true);
       m.capture.armed = true;
     }

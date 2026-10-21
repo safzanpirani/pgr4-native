@@ -119,6 +119,11 @@ struct DrawState {
   uint32_t depth_surface = 0;
 };
 
+// One register value, for the render thread's copy of the register file (renderer.h).
+struct RegWrite {
+  uint32_t reg, value;
+};
+
 class GuestStateTracker {
  public:
   // After a flushing call returned. `r` = r3..r10 at entry (r[0] = device), `ret` = r3 after.
@@ -134,6 +139,10 @@ class GuestStateTracker {
   // Shaders bound at the last draw (the IM_LOAD address the D3D uses for them).
   const ShaderRef& vs() const { return vs_; }
   const ShaderRef& ps() const { return ps_; }
+  // Appends the registers whose value changed since the last call (since start-up the first
+  // time; the copy it feeds starts zeroed like regs_) and forgets them. The render thread
+  // replays these into its own register file (renderer.cpp).
+  void TakeChanges(std::vector<RegWrite>* out);
 
   // Oracle (M1 tap): compares the registers the tap has seen written (`tap_written[r] != 0`)
   // with this view at the current draw. Returns the number of differing registers and adds
@@ -147,6 +156,21 @@ class GuestStateTracker {
 
  private:
   void Attach(const uint8_t* base, uint32_t device);
+  // Every write to regs_ goes through Put/Copy, which note the changed registers. raw_ keeps
+  // each register as the guest stores it (big-endian), so Copy compares guest memory with it
+  // four registers at a time without swapping.
+  void Mark(uint32_t reg) {
+    changed_[reg >> 6] |= 1ull << (reg & 63);
+    changed_words_[reg >> 12] |= 1ull << ((reg >> 6) & 63);
+  }
+  void Put(uint32_t reg, uint32_t value) {
+    if (regs_[reg] == value) return;
+    regs_[reg] = value;
+    raw_[reg] = __builtin_bswap32(value);
+    Mark(reg);
+  }
+  void Copy(uint32_t reg, const uint8_t* base, uint32_t src, uint32_t count);
+  void LoadLiterals(const uint8_t* base, uint32_t table, uint32_t data);
 
   uint32_t device_ = 0;
   ShaderRef vs_, ps_;
@@ -158,6 +182,11 @@ class GuestStateTracker {
   bool vs_imm_pending_valid_ = false;
   uint32_t vs_imm_seq_ = 0;
   uint32_t regs_[kGuestRegisterCount] = {};
+  uint32_t raw_[kGuestRegisterCount] = {};
+  static constexpr uint32_t kChangedWords = kGuestRegisterCount / 64;
+  static constexpr uint32_t kChangedWordGroups = (kChangedWords + 63) / 64;
+  uint64_t changed_[kChangedWords] = {};             // bit per register
+  uint64_t changed_words_[kChangedWordGroups] = {};  // bit per non-zero changed_ word
 };
 
 GuestStateTracker& GuestState();

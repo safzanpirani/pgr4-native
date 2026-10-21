@@ -14,7 +14,14 @@
 #include <rex/system/kernel_state.h>
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
 #include <cstdio>
+#include <cstring>
+#include <deque>
+#include <mutex>
+#include <thread>
+#include <vector>
 
 REXCVAR_DEFINE_BOOL(pgr4_native, false, "PGR4 native",
                     "Run the native D3D12 renderer beside the Xenos plugin (debug window)");
@@ -29,6 +36,10 @@ REXCVAR_DEFINE_INT32(pgr4_native_height, 720, "PGR4 native", "Debug window heigh
 REXCVAR_DEFINE_BOOL(pgr4_native_profile, false, "PGR4 native",
                     "Per-stage CPU time of the draw path (RDTSC), appended to the native CSV as "
                     "st_<stage>_us columns and to the stats log line");
+REXCVAR_DEFINE_BOOL(pgr4_native_render_thread, false, "PGR4 native",
+                    "Record the native frames on their own thread (\"PGR4 native render\"): the "
+                    "game thread only copies what each D3D call reads from guest memory and "
+                    "queues it, at most one frame ahead of the render thread");
 REXCVAR_DECLARE(int32_t, pgr4_d3d_stats_frames);
 
 namespace pgr4::native {
@@ -49,7 +60,8 @@ uint64_t NowNs() {
 struct NativeRenderer::Csv {
   std::FILE* file = nullptr;
   // Window for the log summary.
-  uint64_t frames = 0, draws = 0, draw_ns = 0, swap_ns = 0, frame_ns = 0;
+  uint64_t frames = 0, draws = 0, draw_ns = 0, swap_ns = 0, frame_ns = 0, hook_ns = 0,
+           hook_wait_ns = 0;
   // Profile: RDTSC calibration (ticks and ns at start-up) and the window's stage ticks.
   uint64_t tsc0 = 0, ns0 = 0;
   uint64_t stage_ticks[profile::kStageCount] = {}, track_calls = 0;
@@ -60,7 +72,7 @@ struct NativeRenderer::Csv {
 };
 
 namespace {
-bool g_failed = false;  // set once the device or swapchain failed; the native path stops
+std::atomic<bool> g_failed{false};  // set once the device or swapchain failed; the native path stops
 
 // The game window: the process's visible, unowned top-level window (the SDK's), not ours.
 HWND FindGameWindow() {
@@ -89,6 +101,97 @@ bool FlagOn(const char* name) {
   return v == "true" || v == "1";
 }
 }  // namespace
+
+// ---------------------------------------------------------------------------------------------
+// Render thread mode (renderer.h).
+
+struct NativeRenderer::Queue {
+  // Commands per batch before the guest thread hands it over (and at every Swap). Each
+  // hand-over can wake the render thread (a syscall), so batches are large.
+  static constexpr size_t kBatchCommands = 256;
+
+  enum Kind : uint8_t { kDraw, kClear, kResolve, kSwap };
+  struct Cmd {
+    Kind kind;
+    uint32_t index;    // into the batch's vector of that kind
+    uint32_t reg_end;  // Batch::regs up to here are applied before the command
+  };
+  struct DrawCmd {
+    DrawState state;  // regs and immediate ucode pointers are filled in on the render thread
+    DrawPrep prep;
+    uint32_t copy_begin, copy_end;  // Batch::copies
+  };
+  struct SwapCmd {
+    SwapCall call;
+    // Guest-thread numbers of the frame, added to the render thread's before its CSV row.
+    uint64_t hook_ns, hook_wait_ns, state_fail, upload_bytes, uploads, track_calls;
+    uint64_t ticks[profile::kStageCount];
+  };
+  struct Batch {
+    std::vector<Cmd> cmds;
+    std::vector<RegWrite> regs;
+    std::vector<VertexCopy> copies;
+    std::vector<DrawCmd> draws;
+    std::vector<ClearCall> clears;
+    std::vector<ResolveParams> resolves;
+    std::vector<SwapCmd> swaps;
+    void Clear() {
+      cmds.clear();
+      regs.clear();
+      copies.clear();
+      draws.clear();
+      clears.clear();
+      resolves.clear();
+      swaps.clear();
+    }
+  };
+
+  std::mutex mutex;
+  std::condition_variable work_cv, done_cv;
+  std::deque<std::unique_ptr<Batch>> pending;  // guest -> render thread
+  std::vector<std::unique_ptr<Batch>> spare;   // render -> guest thread
+  uint64_t frames_done = 0;                    // Swaps the render thread finished (mutex)
+  // Frames whose fence the GPU reached (render thread writes; DrawRenderer::Prepare's tags).
+  std::atomic<uint64_t> gpu_frames_done{0};
+  std::thread thread;
+
+  // Guest thread.
+  std::unique_ptr<Batch> current = std::make_unique<Batch>();
+  uint64_t frame = 0;  // Swaps queued
+  bool capture_armed = false;
+  uint64_t hook_ns = 0, hook_wait_ns = 0, state_fail = 0;
+
+  // Render thread.
+  uint32_t regs[kGuestRegisterCount] = {};
+  std::deque<std::pair<uint64_t, uint64_t>> frame_fences;  // (frames submitted, their fence)
+
+  void Publish() {
+    std::unique_ptr<Batch> next;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      pending.push_back(std::move(current));
+      if (!spare.empty()) {
+        next = std::move(spare.back());
+        spare.pop_back();
+      }
+    }
+    work_cv.notify_one();
+    current = next ? std::move(next) : std::make_unique<Batch>();
+  }
+  void Push(Kind kind, uint32_t index) {
+    GuestState().TakeChanges(&current->regs);
+    current->cmds.push_back({kind, index, uint32_t(current->regs.size())});
+    if (kind != kSwap && current->cmds.size() >= kBatchCommands) Publish();
+  }
+  // Blocks the guest thread until the render thread finished `frames` Swaps; returns the ns.
+  uint64_t WaitFrames(uint64_t frames) {
+    std::unique_lock<std::mutex> lock(mutex);
+    if (frames_done >= frames) return 0;
+    const uint64_t t0 = NowNs();
+    done_cv.wait(lock, [&] { return frames_done >= frames; });
+    return NowNs() - t0;
+  }
+};
 
 NativeRenderer* NativeRenderer::Get() {
   if (!(REXCVAR_GET(pgr4_native) || REXCVAR_GET(pgr4_native_primary)) || g_failed)
@@ -155,7 +258,8 @@ bool NativeRenderer::Initialize() {
       std::fprintf(csv_->file,
                    "frame,draws,clears,resolves,state_fail,draw_us,clear_us,resolve_us,swap_us,"
                    "us_per_draw,frame_ms,host_draws,skipped,unsupported,failed,pso_created,"
-                   "upload_kb,textures,textures_missing,front_buffer");
+                   "upload_kb,textures,textures_missing,front_buffer,hook_us,hook_wait_us,"
+                   "reg_writes");
       if (profile::g.on) {
         for (const char* n : profile::kStageNames) std::fprintf(csv_->file, ",st_%s_us", n);
         std::fprintf(csv_->file, ",track_calls,tex_memo_miss,tex_created,tex_create_us,"
@@ -170,6 +274,11 @@ bool NativeRenderer::Initialize() {
     }
   }
   frame_start_ns_ = NowNs();
+  if (REXCVAR_GET(pgr4_native_render_thread)) {
+    queue_ = std::make_unique<Queue>();
+    queue_->thread = std::thread([this] { RenderThreadMain(); });
+    REXLOG_INFO("PGR4 native: recording on the render thread");
+  }
   return true;
 }
 
@@ -185,7 +294,160 @@ void NativeRenderer::BeginFrameModules(const uint8_t* base) {
   frame_begun_ = true;
 }
 
+void NativeRenderer::RenderThreadMain() {
+  SetThreadDescription(GetCurrentThread(), L"PGR4 native render");
+  profile::g.on = REXCVAR_GET(pgr4_native_profile);
+  Queue& q = *queue_;
+  for (;;) {
+    std::unique_ptr<Queue::Batch> b;
+    {
+      std::unique_lock<std::mutex> lock(q.mutex);
+      q.work_cv.wait(lock, [&] { return !q.pending.empty(); });
+      b = std::move(q.pending.front());
+      q.pending.pop_front();
+    }
+    size_t reg = 0;
+    for (const Queue::Cmd& c : b->cmds) {
+      stats_.reg_writes += c.reg_end - reg;
+      for (; reg < c.reg_end; ++reg) q.regs[b->regs[reg].reg] = b->regs[reg].value;
+      if (g_failed && c.kind != Queue::kSwap) continue;
+      switch (c.kind) {
+        case Queue::kDraw: {
+          Queue::DrawCmd& d = b->draws[c.index];
+          d.state.regs = q.regs;
+          d.prep.copies = b->copies.data() + d.copy_begin;
+          d.prep.copy_count = d.copy_end - d.copy_begin;
+          ExecuteDraw(d.state, &d.prep);
+          break;
+        }
+        case Queue::kClear: ExecuteClear(b->clears[c.index]); break;
+        case Queue::kResolve: ExecuteResolve(b->resolves[c.index]); break;
+        case Queue::kSwap: {
+          const Queue::SwapCmd& s = b->swaps[c.index];
+          if (!g_failed) {
+            stats_.hook_ns = s.hook_ns;
+            stats_.hook_wait_ns = s.hook_wait_ns;
+            stats_.draws += s.state_fail;
+            stats_.state_fail += s.state_fail;
+            draw_->AddUploads(s.upload_bytes, s.uploads);
+            if (profile::g.on) {
+              for (uint32_t i = 0; i < profile::kStageCount; ++i) profile::g.ticks[i] += s.ticks[i];
+              profile::g.track_calls += s.track_calls;
+            }
+            ExecuteSwap(s.call);
+          }
+          {
+            std::lock_guard<std::mutex> lock(q.mutex);
+            ++q.frames_done;
+          }
+          q.done_cv.notify_all();
+          break;
+        }
+      }
+    }
+    b->Clear();
+    std::lock_guard<std::mutex> lock(q.mutex);
+    q.spare.push_back(std::move(b));
+  }
+}
+
+void NativeRenderer::QueueDraw(const uint8_t* base, const HookArgs& args) {
+  const uint64_t t0 = NowNs();
+  profile::Begin();
+  Queue& q = *queue_;
+  base_ = base;
+  Queue::Batch& b = *q.current;
+  Queue::DrawCmd& d = b.draws.emplace_back();
+  const bool ok = ReadDrawState(base, args.device, args, &d.state);
+  profile::Mark(profile::kReadState);
+  if (!ok) {
+    b.draws.pop_back();
+    ++q.state_fail;
+  } else {
+    d.copy_begin = uint32_t(b.copies.size());
+    // Upload memory of frame F is tagged F + 1: free once F's fence completed.
+    draw_->Prepare(d.state, q.frame + 1, &d.prep, &b.copies);
+    d.copy_end = uint32_t(b.copies.size());
+    d.state.regs = nullptr;
+    d.state.vs.immediate = d.state.ps.immediate = nullptr;  // Prepare loaded the shaders
+    q.Push(Queue::kDraw, uint32_t(b.draws.size() - 1));
+    profile::Mark(profile::kCapRecord);
+  }
+  q.hook_ns += NowNs() - t0;
+}
+
+void NativeRenderer::QueueClear(const uint8_t* base, const HookArgs& args) {
+  const uint64_t t0 = NowNs();
+  profile::Scope scope(profile::kCapRecord);
+  Queue& q = *queue_;
+  base_ = base;
+  Queue::Batch& b = *q.current;
+  ClearCall& c = b.clears.emplace_back();
+  if (RenderTargets::DecodeClear(base, args, &c))
+    q.Push(Queue::kClear, uint32_t(b.clears.size() - 1));
+  else
+    b.clears.pop_back();
+  q.hook_ns += NowNs() - t0;
+}
+
+void NativeRenderer::QueueResolve(const uint8_t* base, const HookArgs& args) {
+  const uint64_t t0 = NowNs();
+  profile::Scope scope(profile::kCapRecord);
+  Queue& q = *queue_;
+  base_ = base;
+  Queue::Batch& b = *q.current;
+  ResolveParams& p = b.resolves.emplace_back();
+  if (DecodeResolve(base, args, &p))
+    q.Push(Queue::kResolve, uint32_t(b.resolves.size() - 1));
+  else
+    b.resolves.pop_back();  // logged once per reason by DecodeResolve
+  q.hook_ns += NowNs() - t0;
+}
+
+void NativeRenderer::QueueSwap(const uint8_t* base, const HookArgs& args) {
+  const uint64_t t0 = NowNs();
+  Queue& q = *queue_;
+  base_ = base;
+  Queue::Batch& b = *q.current;
+  Queue::SwapCmd& s = b.swaps.emplace_back();
+  Presenter::ReadSwap(base, args, &s.call);
+  // Captures: the Swap that arms one (HoldFullReadback) and the captured one run before the
+  // guest continues, as without the render thread.
+  bool sync = q.capture_armed;
+  if (q.capture_armed) {
+    q.capture_armed = false;
+    s.call.capture_request = 0;
+  } else {
+    q.capture_armed = sync = present_->CaptureRequested(q.frame);
+    s.call.capture_request = sync ? 1 : 0;
+  }
+  draw_->EndFramePrepare(q.gpu_frames_done.load(std::memory_order_acquire), &s.upload_bytes,
+                         &s.uploads);
+  // At most one frame ahead: frame F is queued once the render thread finished F - 1.
+  const uint64_t wait = q.WaitFrames(q.frame);
+  q.hook_wait_ns += wait;
+  s.state_fail = q.state_fail;
+  s.hook_wait_ns = q.hook_wait_ns;
+  const uint64_t t1 = NowNs();
+  s.hook_ns = q.hook_ns + (t1 - t0);
+  s.track_calls = profile::g.track_calls;
+  std::memcpy(s.ticks, profile::g.ticks, sizeof(s.ticks));
+  for (uint64_t& t : profile::g.ticks) t = 0;
+  profile::g.track_calls = 0;
+  q.state_fail = q.hook_ns = q.hook_wait_ns = 0;
+  q.Push(Queue::kSwap, uint32_t(b.swaps.size() - 1));
+  q.Publish();
+  ++q.frame;
+  // Handing over and a capture's wait count towards the next frame.
+  if (sync) q.hook_wait_ns += q.WaitFrames(q.frame);
+  q.hook_ns += NowNs() - t1;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Hook entry points.
+
 void NativeRenderer::OnDraw(const uint8_t* base, const HookArgs& args) {
+  if (queue_) return QueueDraw(base, args);
   const uint64_t t0 = NowNs();
   profile::Begin();
   BeginFrame(base);
@@ -201,6 +463,7 @@ void NativeRenderer::OnDraw(const uint8_t* base, const HookArgs& args) {
 }
 
 void NativeRenderer::OnClear(const uint8_t* base, const HookArgs& args) {
+  if (queue_) return QueueClear(base, args);
   const uint64_t t0 = NowNs();
   BeginFrame(base);
   ++stats_.clears;
@@ -209,6 +472,7 @@ void NativeRenderer::OnClear(const uint8_t* base, const HookArgs& args) {
 }
 
 void NativeRenderer::OnResolve(const uint8_t* base, const HookArgs& args) {
+  if (queue_) return QueueResolve(base, args);
   const uint64_t t0 = NowNs();
   BeginFrame(base);
   ++stats_.resolves;
@@ -219,13 +483,51 @@ void NativeRenderer::OnResolve(const uint8_t* base, const HookArgs& args) {
 }
 
 void NativeRenderer::OnSwap(const uint8_t* base, const HookArgs& args) {
+  if (queue_) return QueueSwap(base, args);
+  base_ = base;
+  SwapCall swap;
+  Presenter::ReadSwap(base, args, &swap);
+  ExecuteSwap(swap);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Recording (render thread, or the guest thread without it).
+
+void NativeRenderer::ExecuteDraw(const DrawState& state, const DrawPrep* prep) {
   const uint64_t t0 = NowNs();
-  BeginFrame(base);
+  profile::Begin();
+  BeginFrame(base_);
+  ++stats_.draws;
+  draw_->OnDraw(base_, state, prep);
+  stats_.draw_ns += NowNs() - t0;
+}
+
+void NativeRenderer::ExecuteClear(const ClearCall& c) {
+  const uint64_t t0 = NowNs();
+  BeginFrame(base_);
+  ++stats_.clears;
+  rt_->Clear(device_->command_list(), c.regs, c.bound_colors, c.depth_bound, c.height, c.p);
+  stats_.clear_ns += NowNs() - t0;
+}
+
+void NativeRenderer::ExecuteResolve(const ResolveParams& p) {
+  const uint64_t t0 = NowNs();
+  BeginFrame(base_);
+  ++stats_.resolves;
+  resolver_->Resolve(device_->command_list(), p);
+  draw_->InvalidateListState();
+  stats_.resolve_ns += NowNs() - t0;
+}
+
+void NativeRenderer::ExecuteSwap(const SwapCall& swap) {
+  const uint64_t t0 = NowNs();
+  BeginFrame(base_);
   D3D12Device& d = *device_;
   // The resolved front buffer into the debug window (back buffer PRESENT in and out).
-  present_->OnSwap(base, args);
+  present_->OnSwap(swap);
   // The frame's texture copies read upload memory the untile workers fill.
   textures_->FinishUploads();
+  const uint64_t fence = d.frame_fence();
   if (!d.EndFrame()) {
     g_failed = true;
     REXLOG_ERROR("PGR4 native: frame {} failed; native path off for the rest of the run",
@@ -235,12 +537,24 @@ void NativeRenderer::OnSwap(const uint8_t* base, const HookArgs& args) {
   ++frame_index_;
   frame_begun_ = false;
   d.SetTitleFrame(frame_index_);
-  textures_->Retire(d.completed_fence());
-  draw_->EndFrame(d.completed_fence());
-  resolver_->AfterSwap(base);
-  present_->AfterEndFrame(base);
+  const uint64_t completed = d.completed_fence();
+  if (queue_) {
+    // Frees the guest thread's vertex upload memory of finished frames (Prepare's tags).
+    Queue& q = *queue_;
+    q.frame_fences.emplace_back(frame_index_, fence);
+    while (!q.frame_fences.empty() && q.frame_fences.front().second <= completed) {
+      q.gpu_frames_done.store(q.frame_fences.front().first, std::memory_order_release);
+      q.frame_fences.pop_front();
+    }
+  }
+  textures_->Retire(completed);
+  draw_->EndFrame(completed);
+  resolver_->AfterSwap(base_);
+  present_->AfterEndFrame(base_);
   const uint64_t t1 = NowNs();
   stats_.swap_ns = t1 - t0;
+  if (!queue_)
+    stats_.hook_ns = stats_.draw_ns + stats_.clear_ns + stats_.resolve_ns + stats_.swap_ns;
   WriteCsv(stats_, t1 - frame_start_ns_);
   frame_start_ns_ = t1;
   stats_ = FrameStats{};
@@ -258,7 +572,7 @@ void NativeRenderer::WriteCsv(const FrameStats& s, uint64_t frame_ns) {
     const DrawRenderer::Stats& ds = draw_->stats();
     std::fprintf(csv_->file,
                  "%llu,%llu,%llu,%llu,%llu,%.1f,%.1f,%.1f,%.1f,%.4f,%.3f,%llu,%llu,%llu,%llu,%llu,"
-                 "%.1f,%llu,%llu,%d",
+                 "%.1f,%llu,%llu,%d,%.1f,%.1f,%llu",
                  (unsigned long long)frame_index_ - 1, (unsigned long long)s.draws,
                  (unsigned long long)s.clears, (unsigned long long)s.resolves,
                  (unsigned long long)s.state_fail, s.draw_ns / 1000.0, s.clear_ns / 1000.0,
@@ -267,7 +581,8 @@ void NativeRenderer::WriteCsv(const FrameStats& s, uint64_t frame_ns) {
                  (unsigned long long)ds.unsupported, (unsigned long long)ds.failed,
                  (unsigned long long)ds.pso_created, ds.upload_bytes / 1024.0,
                  (unsigned long long)ds.textures, (unsigned long long)ds.textures_missing,
-                 present_->front_buffer_found() ? 1 : 0);
+                 present_->front_buffer_found() ? 1 : 0, s.hook_ns / 1000.0, s.hook_wait_ns / 1000.0,
+                 (unsigned long long)s.reg_writes);
     if (profile::g.on) {
       for (uint64_t t : profile::g.ticks) std::fprintf(csv_->file, ",%.1f", double(t) / ticks_per_us);
       std::fprintf(csv_->file, ",%llu", (unsigned long long)profile::g.track_calls);
@@ -297,6 +612,8 @@ void NativeRenderer::WriteCsv(const FrameStats& s, uint64_t frame_ns) {
   w.draw_ns += s.draw_ns;
   w.swap_ns += s.swap_ns;
   w.frame_ns += frame_ns;
+  w.hook_ns += s.hook_ns;
+  w.hook_wait_ns += s.hook_wait_ns;
   if (profile::g.on) {
     for (uint32_t i = 0; i < profile::kStageCount; ++i) w.stage_ticks[i] += profile::g.ticks[i];
     w.track_calls += profile::g.track_calls;
@@ -308,10 +625,11 @@ void NativeRenderer::WriteCsv(const FrameStats& s, uint64_t frame_ns) {
   if (every > 0 && w.frames >= uint64_t(every)) {
     const double n = double(w.frames);
     REXLOG_INFO("PGR4 native: frames {} | per frame: draws {:.1f}, draw CPU {:.1f} us "
-                "({:.4f} us/draw), swap {:.1f} us, frame {:.2f} ms",
+                "({:.4f} us/draw), swap {:.1f} us, frame {:.2f} ms, game thread {:.1f} us "
+                "(waiting {:.1f} us)",
                 frame_index_, w.draws / n, w.draw_ns / 1000.0 / n,
                 w.draws ? w.draw_ns / 1000.0 / double(w.draws) : 0.0, w.swap_ns / 1000.0 / n,
-                w.frame_ns / 1e6 / n);
+                w.frame_ns / 1e6 / n, w.hook_ns / 1000.0 / n, w.hook_wait_ns / 1000.0 / n);
     if (profile::g.on && w.draws) {
       // ns per draw for each stage (the hook-side ones are per draw too, for comparison).
       std::string line;
@@ -326,7 +644,7 @@ void NativeRenderer::WriteCsv(const FrameStats& s, uint64_t frame_ns) {
       for (uint64_t& t : w.stage_ticks) t = 0;
       w.track_calls = 0;
     }
-    w.frames = w.draws = w.draw_ns = w.swap_ns = w.frame_ns = 0;
+    w.frames = w.draws = w.draw_ns = w.swap_ns = w.frame_ns = w.hook_ns = w.hook_wait_ns = 0;
   }
 }
 

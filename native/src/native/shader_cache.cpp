@@ -25,6 +25,7 @@ ShaderCache::~ShaderCache() = default;
 DxbcShader* ShaderCache::Load(rex::graphics::xenos::ShaderType type, const uint32_t* guest_ucode,
                               uint32_t dword_count) {
   uint64_t hash = XXH3_64bits(guest_ucode, size_t(dword_count) * sizeof(uint32_t));
+  std::lock_guard<std::mutex> lock(load_mutex_);
   auto it = shaders_.find(hash);
   if (it != shaders_.end()) return it->second.get();
   auto t = std::chrono::steady_clock::now();

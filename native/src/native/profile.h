@@ -4,7 +4,9 @@
 // NativeRenderer calibrates ticks to ns once per frame against NowNs and appends one µs column
 // per stage to the native CSV. Off by default: then each Mark is one predictable branch.
 //
-// Threading: the hook thread only (like the renderer's On* calls).
+// Threading: one State per thread. With the render thread (renderer.h) the guest thread's
+// stages (read_state, cap_*, track, imm_vs) are handed to the render thread at each Swap and
+// added to its State before the CSV row is written.
 #pragma once
 
 #include <intrin.h>
@@ -30,6 +32,10 @@ enum Stage : uint32_t {
   // Hook side (pgr4_d3d_trace.cpp), outside OnDraw.
   kTrack,       // ReadDirtyMasks + GuestStateTracker::AfterCall, every flushing call
   kImmediateVs, // GuestStateTracker::AfterImmediateVs
+  // Guest thread, render thread mode (renderer.h): the hook-side half of the On* calls.
+  kCapShaders,  // DrawRenderer::Prepare: shader memo/Load
+  kCapVertices, // DrawRenderer::Prepare: vertex/index copies, fan indices
+  kCapRecord,   // register deltas, decoding Clear/Resolve/Swap, queueing
   // Nested inside kTextures (Scope timers, not part of the Mark chain; not summed with it).
   kTexMiss,     // bind_textures with no BindMemo hit (includes kTexGet and kTexSrv)
   kTexGet,      // TextureCache::Get calls on that path
@@ -40,7 +46,8 @@ enum Stage : uint32_t {
 inline constexpr const char* kStageNames[kStageCount] = {
     "read_state", "shaders",  "setup",    "rt_bind",  "translate", "pipeline",
     "textures",   "sysconst", "pack",     "vertices", "cbv",       "record",
-    "track",      "imm_vs",   "tex_miss", "tex_get",  "tex_srv"};
+    "track",      "imm_vs",   "cap_shaders", "cap_vertices", "cap_record", "tex_miss",
+    "tex_get",    "tex_srv"};
 
 // Per-frame event counts (CSV columns, reset every frame). Counted whether or not the profiler
 // is on (one increment each).
@@ -69,7 +76,7 @@ struct State {
   uint64_t track_calls = 0;
   uint64_t counters[kCounterCount] = {};
 };
-inline State g;
+inline thread_local State g;
 
 inline void Count(Counter c) { ++g.counters[c]; }
 

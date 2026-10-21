@@ -19,7 +19,10 @@
 // and logs the PSNR (RGB, 8 bit) of the pair and appends it to <dir>\captures.csv.
 // Both images are the front buffer before the presenter's gamma ramp.
 //
-// Threading: the renderer's OnSwap only (guest thread).
+// Threading: the renderer's OnSwap only (guest thread). With the render thread (renderer.h)
+// ReadSwap and CaptureRequested run on the guest thread and OnSwap/AfterEndFrame on the
+// render thread; the renderer runs the Swaps around a capture synchronously (the guest thread
+// waits in its Swap hook), so the hold and the guest memory read keep their meaning.
 #pragma once
 
 #include "d3d12_device.h"
@@ -30,6 +33,14 @@
 
 namespace pgr4::native {
 
+// What OnSwap needs from the guest Swap call (read at the call).
+struct SwapCall {
+  uint32_t texture = 0;  // r4: the front buffer D3DBaseTexture (0 = none)
+  uint32_t fetch[6] = {};  // its fetch constant (+28), as stored (virtual address)
+  // -1: OnSwap checks for a capture request itself; 0/1: the caller did (CaptureRequested).
+  int8_t capture_request = -1;
+};
+
 class Presenter {
  public:
   explicit Presenter(NativeRenderer& renderer);
@@ -39,10 +50,15 @@ class Presenter {
 
   bool Initialize();
 
+  // Reads the Swap's front buffer texture object from guest memory.
+  static void ReadSwap(const uint8_t* base, const HookArgs& args, SwapCall* out);
+  // A capture was requested (file, F12 or --pgr4_native_capture_frame == frame).
+  bool CaptureRequested(uint64_t frame);
+
   // In NativeRenderer::OnSwap before D3D12Device::EndFrame: records the blit into the back
   // buffer (PRESENT state on entry and exit) and, for a capture, the readback copy. Sets its own
   // root signature, pipeline and descriptor heap on the list.
-  void OnSwap(const uint8_t* base, const HookArgs& args);
+  void OnSwap(const SwapCall& swap);
 
   // In NativeRenderer::OnSwap after EndFrame: finishes a pending capture (waits for the frame's
   // fence, holds the guest thread, reads guest memory, writes the PNGs).

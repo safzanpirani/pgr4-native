@@ -582,12 +582,13 @@ struct DrawRenderer::Impl {
   D3D12_GPU_VIRTUAL_ADDRESS shared_gpu = 0;
   std::unique_ptr<std::atomic<uint64_t>[]> valid;
   void* invalidation_handle = nullptr;
-  struct PendingCopy {
-    ID3D12Resource* src;
-    uint64_t src_offset;
-    uint32_t dst, size;
-  };
+  using PendingCopy = VertexCopy;
   std::vector<PendingCopy> copies;
+  // Fence (or Prepare's tag) RequestRange tags vertex upload memory with.
+  uint64_t upload_fence = 0;
+  // Render thread mode: vertex_upload belongs to the guest thread (Prepare/EndFramePrepare).
+  bool threaded = false;
+  uint64_t prep_upload_bytes = 0, prep_uploads = 0;
 
   UploadPool vertex_upload{16u << 20};
   // CPU-cached: CachedCbv compares new constants with its last upload in place.
@@ -785,7 +786,14 @@ struct DrawRenderer::Impl {
   }
 
   bool Initialize();
-  void Draw(const uint8_t* base, const DrawState& s);
+  void Draw(const uint8_t* base, const DrawState& s, const DrawPrep* prep);
+  DxbcShader* LoadShader(ShaderMemo* table, ShaderMemo*& last, const ShaderRef& ref,
+                         xenos::ShaderType type);
+  bool RequestVertices(const DrawState& s, const DxbcShader& vs);
+  void Prepare(const DrawState& s, uint64_t tag, DrawPrep* prep, std::vector<VertexCopy>* out);
+  // A triangle fan as a host triangle list (v1, v2, v0), (v2, v3, v0)... like the plugin's
+  // primitive processor; guest indices are copied raw (the VS still swaps them).
+  void WriteFanIndices(const DrawState& s, uint32_t count, bool wide, uint8_t* out) const;
   void ResetListState();
   bool RequestRange(uint32_t start, uint32_t length, bool watch);
   void FlushCopies(ID3D12GraphicsCommandList* list);
@@ -834,6 +842,7 @@ bool DrawRenderer::Impl::Initialize() {
   }
   membase = memory->physical_membase();
   vertex_upload.SetDevice(device);
+  threaded = REXCVAR_GET(pgr4_native_render_thread);
   constant_upload.SetDevice(device);
   // Race start keeps 3 vertex and 10 constant blocks in flight; creating one there costs up to 16 ms.
   vertex_upload.Reserve(4);
@@ -1020,14 +1029,19 @@ bool DrawRenderer::Impl::RequestRange(uint32_t start, uint32_t length, bool watc
                   start, length);
     return false;
   }
-  const uint64_t fence = r.frame_fence();
+  const uint64_t fence = upload_fence;
   auto copy = [&](uint32_t from, uint32_t size) {
     UploadPool::Alloc a;
     if (!vertex_upload.Allocate(size, 16, fence, &a)) return false;
     std::memcpy(a.cpu, membase + from, size);
     copies.push_back({a.resource, a.offset, from, size});
-    stats.upload_bytes += size;
-    ++stats.uploads;
+    if (threaded) {
+      prep_upload_bytes += size;
+      ++prep_uploads;
+    } else {
+      stats.upload_bytes += size;
+      ++stats.uploads;
+    }
     return true;
   };
   if (!watch || (debug_mask & 32)) {  // 32: upload every draw
@@ -1328,7 +1342,120 @@ void DrawRenderer::Impl::Prewarm() {
                 list.size() - prewarm_failed, prewarm_failed, prewarm_ms, prewarm_frames);
 }
 
-void DrawRenderer::Impl::Draw(const uint8_t* base, const DrawState& s) {
+void DrawRenderer::Impl::WriteFanIndices(const DrawState& s, uint32_t count, bool wide,
+                                         uint8_t* out) const {
+  auto guest = [&](uint32_t i) -> uint32_t {
+    if (!s.indexed) return i;
+    const uint8_t* p = membase + s.index_address;
+    if (wide) {
+      uint32_t v;
+      std::memcpy(&v, p + size_t(i) * 4, 4);
+      return v;
+    }
+    uint16_t v;
+    std::memcpy(&v, p + size_t(i) * 2, 2);
+    return v;
+  };
+  for (uint32_t t = 0; t + 2 < count; ++t) {
+    const uint32_t tri[3] = {guest(t + 1), guest(t + 2), guest(0)};
+    for (uint32_t k = 0; k < 3; ++k) {
+      if (wide)
+        reinterpret_cast<uint32_t*>(out)[t * 3 + k] = tri[k];
+      else
+        reinterpret_cast<uint16_t*>(out)[t * 3 + k] = uint16_t(tri[k]);
+    }
+  }
+}
+
+DxbcShader* DrawRenderer::Impl::LoadShader(ShaderMemo* table, ShaderMemo*& last,
+                                           const ShaderRef& ref, xenos::ShaderType type) {
+  if (!ref.ucode || !ref.dwords) return nullptr;
+  // The previous draw's shader again (most draws): no guest memory read, as before the table.
+  if (last && last->shader && last->ucode == ref.ucode && last->dwords == ref.dwords &&
+      last->immediate_seq == ref.immediate_seq)
+    return last->shader;
+  // Declaration-patched vertex shaders (IM_LOAD_IMMEDIATE) come from the tracker's copy.
+  const uint32_t* ucode =
+      ref.immediate ? ref.immediate : reinterpret_cast<const uint32_t*>(membase + ref.ucode);
+  uint32_t sample[ShaderMemo::kSample];
+  for (uint32_t i = 0; i < ShaderMemo::kSample / 2; ++i) {
+    sample[i] = ucode[std::min(i, ref.dwords - 1)];
+    sample[ShaderMemo::kSample / 2 + i] = ucode[ref.dwords - 1 - std::min(i, ref.dwords - 1)];
+  }
+  ShaderMemo& memo = table[((ref.ucode >> 4) ^ ref.dwords) & (ShaderMemo::kEntries - 1)];
+  last = &memo;
+  if (memo.shader && memo.ucode == ref.ucode && memo.dwords == ref.dwords &&
+      memo.immediate_seq == ref.immediate_seq &&
+      std::memcmp(memo.sample, sample, sizeof(sample)) == 0)
+    return memo.shader;
+  memo.ucode = ref.ucode;
+  memo.dwords = ref.dwords;
+  memo.immediate_seq = ref.immediate_seq;
+  std::memcpy(memo.sample, sample, sizeof(sample));
+  ++diag.shader_loads;
+  memo.shader = shaders.Load(type, ucode, ref.dwords);
+  return memo.shader;
+}
+
+// Vertex ranges the VS fetches and the index range (not for fans: their indices are read
+// directly) into `copies`.
+bool DrawRenderer::Impl::RequestVertices(const DrawState& s, const DxbcShader& vs) {
+  const RegisterFile& regs = *reinterpret_cast<const RegisterFile*>(s.regs);
+  const Shader::ConstantRegisterMap& vmap = vs.constant_register_map();
+  for (uint32_t w = 0; w < 3; ++w) {
+    uint32_t bits = vmap.vertex_fetch_bitmap[w];
+    while (bits) {
+      uint32_t b = uint32_t(std::countr_zero(bits));
+      bits &= bits - 1;
+      const uint32_t index = w * 32 + b;
+      xenos::xe_gpu_vertex_fetch_t f = regs.GetVertexFetch(index);
+      if (f.type != xenos::FetchConstantType::kVertex) {
+        DRAW_LOG_ONCE(log_vfetch, "PGR4 native draw: vertex fetch {} has type {} ({:08X} {:08X})",
+                      index, uint32_t(f.type), f.dword_0, f.dword_1);
+        if (f.type != xenos::FetchConstantType::kInvalidVertex) return false;
+      }
+      const uint32_t start = f.address << 2, size = f.size << 2;
+      const bool inline_data = s.inline_vertices && start == s.inline_vertices;
+      if (!RequestRange(start, size, !inline_data)) return false;
+    }
+  }
+  if (s.indexed && xenos::PrimitiveType(s.primitive) != xenos::PrimitiveType::kTriangleFan)
+    return RequestRange(s.index_address, s.count * (s.index_32bit ? 4u : 2u), true);
+  return true;
+}
+
+void DrawRenderer::Impl::Prepare(const DrawState& s, uint64_t tag, DrawPrep* prep,
+                                 std::vector<VertexCopy>* out) {
+  *prep = DrawPrep{};
+  if (!s.vs.ucode || !s.vs.dwords) return;
+  prep->vs = LoadShader(vs_memo, vs_last, s.vs, xenos::ShaderType::kVertex);
+  prep->ps = LoadShader(ps_memo, ps_last, s.ps, xenos::ShaderType::kPixel);
+  profile::Mark(profile::kCapShaders);
+  if (!prep->vs) return;
+  upload_fence = tag;
+  const bool indexed_ok = !s.indexed || s.index_address;
+  prep->upload_ok = indexed_ok && RequestVertices(s, *prep->vs);
+  // Copies made before a failed range still go out: their pages are marked valid already.
+  out->insert(out->end(), copies.begin(), copies.end());
+  copies.clear();
+  // Triangle fans: host indices from the guest's now (Draw reads them from here).
+  const uint32_t count = s.count;
+  if (prep->upload_ok && xenos::PrimitiveType(s.primitive) == xenos::PrimitiveType::kTriangleFan &&
+      count >= 3) {
+    const uint32_t host_count = (count - 2) * 3;
+    const bool wide = s.indexed ? s.index_32bit : count > 0xFFFF;
+    UploadPool::Alloc a;
+    if (vertex_upload.Allocate(uint64_t(host_count) * (wide ? 4 : 2), 16, tag, &a)) {
+      WriteFanIndices(s, count, wide, a.cpu);
+      prep->fan_indices = a.gpu;
+      prep->fan_count = host_count;
+      prep->fan_wide = wide;
+    }
+  }
+  profile::Mark(profile::kCapVertices);
+}
+
+void DrawRenderer::Impl::Draw(const uint8_t* base, const DrawState& s, const DrawPrep* prep) {
   (void)base;
   ID3D12GraphicsCommandList* list = r.command_list();
   if (list_frame != r.frame_index()) {
@@ -1339,6 +1466,21 @@ void DrawRenderer::Impl::Draw(const uint8_t* base, const DrawState& s) {
                           &cb_desc_vs, &cb_desc_ps})
       cb->Reset();
   }
+  if (prep) {
+    // The guest thread copied the ranges (and marked their pages valid): they go into shared
+    // memory whether or not the draw is issued.
+    if (prep->copy_count) {
+      TransitionShared(list, D3D12_RESOURCE_STATE_COPY_DEST);
+      for (uint32_t i = 0; i < prep->copy_count; ++i) {
+        const VertexCopy& c = prep->copies[i];
+        list->CopyBufferRegion(shared.Get(), c.dst, c.src, c.src_offset, c.size);
+      }
+    }
+    if (!prep->upload_ok) {
+      ++stats.failed;
+      return;
+    }
+  }
   const RegisterFile& regs = *reinterpret_cast<const RegisterFile*>(s.regs);
   const xenos::PrimitiveType prim = xenos::PrimitiveType(s.primitive);
 
@@ -1347,37 +1489,10 @@ void DrawRenderer::Impl::Draw(const uint8_t* base, const DrawState& s) {
     ++stats.skipped;
     return;
   }
-  auto load = [&](ShaderMemo* table, ShaderMemo*& last, const ShaderRef& ref,
-                  xenos::ShaderType type) -> DxbcShader* {
-    if (!ref.ucode || !ref.dwords) return nullptr;
-    // The previous draw's shader again (most draws): no guest memory read, as before the table.
-    if (last && last->shader && last->ucode == ref.ucode && last->dwords == ref.dwords &&
-        last->immediate_seq == ref.immediate_seq)
-      return last->shader;
-    // Declaration-patched vertex shaders (IM_LOAD_IMMEDIATE) come from the tracker's copy.
-    const uint32_t* ucode =
-        ref.immediate ? ref.immediate : reinterpret_cast<const uint32_t*>(membase + ref.ucode);
-    uint32_t sample[ShaderMemo::kSample];
-    for (uint32_t i = 0; i < ShaderMemo::kSample / 2; ++i) {
-      sample[i] = ucode[std::min(i, ref.dwords - 1)];
-      sample[ShaderMemo::kSample / 2 + i] = ucode[ref.dwords - 1 - std::min(i, ref.dwords - 1)];
-    }
-    ShaderMemo& memo = table[((ref.ucode >> 4) ^ ref.dwords) & (ShaderMemo::kEntries - 1)];
-    last = &memo;
-    if (memo.shader && memo.ucode == ref.ucode && memo.dwords == ref.dwords &&
-        memo.immediate_seq == ref.immediate_seq &&
-        std::memcmp(memo.sample, sample, sizeof(sample)) == 0)
-      return memo.shader;
-    memo.ucode = ref.ucode;
-    memo.dwords = ref.dwords;
-    memo.immediate_seq = ref.immediate_seq;
-    std::memcpy(memo.sample, sample, sizeof(sample));
-    ++diag.shader_loads;
-    memo.shader = shaders.Load(type, ucode, ref.dwords);
-    return memo.shader;
-  };
-  DxbcShader* vs = load(vs_memo, vs_last, s.vs, xenos::ShaderType::kVertex);
-  DxbcShader* ps = load(ps_memo, ps_last, s.ps, xenos::ShaderType::kPixel);
+  DxbcShader* vs =
+      prep ? prep->vs : LoadShader(vs_memo, vs_last, s.vs, xenos::ShaderType::kVertex);
+  DxbcShader* ps =
+      prep ? prep->ps : LoadShader(ps_memo, ps_last, s.ps, xenos::ShaderType::kPixel);
   if (!vs) {
     ++stats.failed;
     return;
@@ -1989,40 +2104,16 @@ void DrawRenderer::Impl::Draw(const uint8_t* base, const DrawState& s) {
   PackFloats(cb_float_ps, ps, s.regs, XE_GPU_REG_SHADER_CONSTANT_256_X);
   profile::Mark(profile::kPack);
 
-  // Vertex data and indices into shared memory.
-  bool upload_ok = true;
-  const Shader::ConstantRegisterMap& vmap = vs->constant_register_map();
-  for (uint32_t w = 0; w < 3 && upload_ok; ++w) {
-    uint32_t bits = vmap.vertex_fetch_bitmap[w];
-    while (bits) {
-      uint32_t b = uint32_t(std::countr_zero(bits));
-      bits &= bits - 1;
-      const uint32_t index = w * 32 + b;
-      xenos::xe_gpu_vertex_fetch_t f = regs.GetVertexFetch(index);
-      if (f.type != xenos::FetchConstantType::kVertex) {
-        DRAW_LOG_ONCE(log_vfetch, "PGR4 native draw: vertex fetch {} has type {} ({:08X} {:08X})",
-                      index, uint32_t(f.type), f.dword_0, f.dword_1);
-        if (f.type != xenos::FetchConstantType::kInvalidVertex) {
-          upload_ok = false;
-          break;
-        }
-      }
-      const uint32_t start = f.address << 2, size = f.size << 2;
-      const bool inline_data = s.inline_vertices && start == s.inline_vertices;
-      if (!RequestRange(start, size, !inline_data)) {
-        upload_ok = false;
-        break;
-      }
-    }
-  }
+  // Vertex data and indices into shared memory (made by Prepare with `prep`).
   const uint32_t index_bytes = count * (s.index_32bit ? 4u : 2u);
   const bool fan = prim == xenos::PrimitiveType::kTriangleFan;
-  if (upload_ok && s.indexed && !fan)
-    upload_ok = RequestRange(s.index_address, index_bytes, true);
-  if (!upload_ok) {
-    copies.clear();
-    ++stats.failed;
-    return;
+  if (!prep) {
+    upload_fence = r.frame_fence();
+    if (!RequestVertices(s, *vs)) {
+      copies.clear();
+      ++stats.failed;
+      return;
+    }
   }
   FlushCopies(list);
   profile::Mark(profile::kVertices);
@@ -2126,36 +2217,28 @@ void DrawRenderer::Impl::Draw(const uint8_t* base, const DrawState& s) {
       ++stats.skipped;
       return;
     }
-    const uint32_t host_count = (count - 2) * 3;
-    const bool wide = s.indexed ? s.index_32bit : count > 0xFFFF;
-    UploadPool::Alloc a;
-    if (!vertex_upload.Allocate(uint64_t(host_count) * (wide ? 4 : 2), 16, r.frame_fence(), &a)) {
-      ++stats.failed;
-      return;
-    }
-    auto guest = [&](uint32_t i) -> uint32_t {
-      if (!s.indexed) return i;
-      const uint8_t* p = membase + s.index_address;
-      if (wide) {
-        uint32_t v;
-        std::memcpy(&v, p + size_t(i) * 4, 4);
-        return v;
-      }
-      uint16_t v;
-      std::memcpy(&v, p + size_t(i) * 2, 2);
-      return v;
-    };
-    for (uint32_t t = 0; t + 2 < count; ++t) {
-      const uint32_t tri[3] = {guest(t + 1), guest(t + 2), guest(0)};
-      for (uint32_t k = 0; k < 3; ++k) {
-        if (wide)
-          reinterpret_cast<uint32_t*>(a.cpu)[t * 3 + k] = tri[k];
-        else
-          reinterpret_cast<uint16_t*>(a.cpu)[t * 3 + k] = uint16_t(tri[k]);
-      }
-    }
     D3D12_INDEX_BUFFER_VIEW ibv;
-    ibv.BufferLocation = a.gpu;
+    uint32_t host_count;
+    bool wide;
+    if (prep) {
+      if (!prep->fan_count) {
+        ++stats.failed;
+        return;
+      }
+      host_count = prep->fan_count;
+      wide = prep->fan_wide;
+      ibv.BufferLocation = prep->fan_indices;
+    } else {
+      host_count = (count - 2) * 3;
+      wide = s.indexed ? s.index_32bit : count > 0xFFFF;
+      UploadPool::Alloc a;
+      if (!vertex_upload.Allocate(uint64_t(host_count) * (wide ? 4 : 2), 16, r.frame_fence(), &a)) {
+        ++stats.failed;
+        return;
+      }
+      WriteFanIndices(s, count, wide, a.cpu);
+      ibv.BufferLocation = a.gpu;
+    }
     ibv.SizeInBytes = host_count * (wide ? 4 : 2);
     ibv.Format = wide ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
     list->IASetIndexBuffer(&ibv);
@@ -2189,7 +2272,21 @@ DrawRenderer::~DrawRenderer() = default;
 
 bool DrawRenderer::Initialize() { return impl_->Initialize(); }
 
-void DrawRenderer::OnDraw(const uint8_t* base, const DrawState& state) { impl_->Draw(base, state); }
+void DrawRenderer::OnDraw(const uint8_t* base, const DrawState& state, const DrawPrep* prep) {
+  impl_->Draw(base, state, prep);
+}
+
+void DrawRenderer::Prepare(const DrawState& state, uint64_t upload_tag, DrawPrep* prep,
+                           std::vector<VertexCopy>* copies) {
+  impl_->Prepare(state, upload_tag, prep, copies);
+}
+
+void DrawRenderer::EndFramePrepare(uint64_t done, uint64_t* upload_bytes, uint64_t* uploads) {
+  impl_->vertex_upload.EndFrame(done);
+  *upload_bytes = impl_->prep_upload_bytes;
+  *uploads = impl_->prep_uploads;
+  impl_->prep_upload_bytes = impl_->prep_uploads = 0;
+}
 
 void DrawRenderer::InvalidateListState() {
   impl_->ResetListState();
@@ -2197,7 +2294,7 @@ void DrawRenderer::InvalidateListState() {
 }
 
 void DrawRenderer::EndFrame(uint64_t completed_fence) {
-  impl_->vertex_upload.EndFrame(completed_fence);
+  if (!impl_->threaded) impl_->vertex_upload.EndFrame(completed_fence);
   impl_->constant_upload.EndFrame(completed_fence);
   impl_->Prewarm();
   impl_->store.Flush();

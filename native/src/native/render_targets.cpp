@@ -336,7 +336,12 @@ bool RenderTargets::Bind(ID3D12GraphicsCommandList* list, const SurfaceRegs& reg
 }
 
 void RenderTargets::OnClear(ID3D12GraphicsCommandList* list, const uint8_t* base, const HookArgs& args) {
-  ClearParams p;
+  ClearCall c;
+  if (DecodeClear(base, args, &c)) Clear(list, c.regs, c.bound_colors, c.depth_bound, c.height, c.p);
+}
+
+bool RenderTargets::DecodeClear(const uint8_t* base, const HookArgs& args, ClearCall* out) {
+  ClearParams& p = out->p;
   auto read_rect = [&](uint32_t a) {
     // D3DRECT {x1, y1, x2, y2}, big-endian LONGs.
     D3D12_RECT r;
@@ -358,7 +363,7 @@ void RenderTargets::OnClear(ID3D12GraphicsCommandList* list, const uint8_t* base
     p.stencil = uint8_t(args.r[5]);
     if (rects)
       for (uint32_t i = 0; i < count && i < 64; ++i) read_rect(rects + i * 16);
-    if (rects && count && p.rects.empty()) return;  // only empty rectangles
+    if (rects && count && p.rects.empty()) return false;  // only empty rectangles
   } else if (args.fn == HookFn::kClearF) {
     // ClearF(dev, Flags r4, pRect r5, pColor r6 (D3DVECTOR4), Z f1, Stencil r7). Also reached
     // from inside BeginTiling (fn_8269C6D0), which clears the tiled scene surfaces through it.
@@ -369,17 +374,18 @@ void RenderTargets::OnClear(ID3D12GraphicsCommandList* list, const uint8_t* base
     p.stencil = uint8_t(args.r[4]);
     if (args.r[2]) {
       read_rect(args.r[2]);
-      if (p.rects.empty()) return;
+      if (p.rects.empty()) return false;
     }
   } else {
-    return;
+    return false;
   }
   const uint32_t device = args.device;
-  const SurfaceRegs regs = SurfaceRegsFromDevice(base, device);
+  out->regs = SurfaceRegsFromDevice(base, device);
   uint32_t bound = 0;
   for (uint32_t i = 0; i < 4; ++i)
     if (Load32(base, device + kDevColorSurfaces + 4 * i)) bound |= 1u << i;
-  const bool depth_bound = Load32(base, device + kDevDepthSurface) != 0;
+  out->bound_colors = bound;
+  out->depth_bound = Load32(base, device + kDevDepthSurface) != 0;
   // The surfaces' height is not in the registers; the viewport bottom is the best hint
   // (PA_CL_VPORT_YSCALE 0x2111, YOFFSET 0x2112). Targets are at least their EDRAM height.
   const float ys = LoadF(base, device + kDevShadow2100 + 0x11 * 4);
@@ -387,7 +393,8 @@ void RenderTargets::OnClear(ID3D12GraphicsCommandList* list, const uint8_t* base
   float bottom = std::fabs(ys) + yo;
   uint32_t height = (bottom > 0.0f && bottom <= float(kMaxHeight)) ? uint32_t(std::ceil(bottom)) : 0;
   for (const D3D12_RECT& r : p.rects) height = std::max(height, uint32_t(std::max<LONG>(r.bottom, 0)));
-  Clear(list, regs, bound, depth_bound, height, p);
+  out->height = height;
+  return true;
 }
 
 void RenderTargets::Clear(ID3D12GraphicsCommandList* list, const SurfaceRegs& regs, uint32_t bound_colors,

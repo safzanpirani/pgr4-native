@@ -5,6 +5,8 @@
 
 #include <rex/logging.h>
 
+#include <emmintrin.h>
+
 #include <cstring>
 
 namespace pgr4::native {
@@ -32,14 +34,6 @@ inline uint64_t Load64(const uint8_t* base, uint32_t a) {
 // Virtual -> physical the way the D3D computes GPU addresses (e.g. sub_8269ADD8's index base).
 inline uint32_t GpuAddress(uint32_t a) {
   return (a & 0x1FFFFFFFu) + ((((a >> 20) & 0xFFFu) + 0x200u) & 0x1000u);
-}
-inline void CopyRegs(uint32_t* dst, const uint8_t* base, uint32_t src, uint32_t count) {
-  const uint8_t* p = Host(base, src);
-  for (uint32_t i = 0; i < count; ++i) {
-    uint32_t v;
-    std::memcpy(&v, p + i * 4, 4);
-    dst[i] = __builtin_bswap32(v);
-  }
 }
 
 // Register blocks the draw functions flush with sub_826A8720, (device offset, first register,
@@ -70,10 +64,60 @@ constexpr uint32_t kFnBeginVertices = 0x8269A4F8, kFnDrawVerticesUP = 0x8269A9A8
 // Shader-rebind dirty bits in the mask at +16 (sub_826A9858): 19 vertex shader, 20 pixel shader.
 constexpr uint64_t kVsRebind = 1ull << 19, kPsRebind = 1ull << 20;
 
+}  // namespace
+
+void GuestStateTracker::Copy(uint32_t reg, const uint8_t* base, uint32_t src, uint32_t count) {
+  const uint8_t* p = Host(base, src);
+  auto put_raw = [&](uint32_t i) {
+    uint32_t v;
+    std::memcpy(&v, p + i * 4, 4);
+    if (v == raw_[reg + i]) return;
+    raw_[reg + i] = v;
+    regs_[reg + i] = __builtin_bswap32(v);
+    Mark(reg + i);
+  };
+  // Most of what the flushing calls copy is unchanged: compare 16 registers per branch.
+  auto eq4 = [&](uint32_t i) {
+    const __m128i g = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + i * 4));
+    const __m128i m = _mm_loadu_si128(reinterpret_cast<const __m128i*>(raw_ + reg + i));
+    return _mm_cmpeq_epi32(g, m);
+  };
+  uint32_t i = 0;
+  for (; i + 16 <= count; i += 16) {
+    const __m128i e = _mm_and_si128(_mm_and_si128(eq4(i), eq4(i + 4)),
+                                    _mm_and_si128(eq4(i + 8), eq4(i + 12)));
+    if (_mm_movemask_epi8(e) == 0xFFFF) continue;
+    for (uint32_t k = 0; k < 16; ++k) put_raw(i + k);
+  }
+  for (; i + 4 <= count; i += 4) {
+    if (_mm_movemask_epi8(eq4(i)) == 0xFFFF) continue;
+    for (uint32_t k = 0; k < 4; ++k) put_raw(i + k);
+  }
+  for (; i < count; ++i) put_raw(i);
+}
+
+void GuestStateTracker::TakeChanges(std::vector<RegWrite>* out) {
+  for (uint32_t s = 0; s < kChangedWordGroups; ++s) {
+    uint64_t words = changed_words_[s];
+    changed_words_[s] = 0;
+    while (words) {
+      const uint32_t w = s * 64 + uint32_t(__builtin_ctzll(words));
+      words &= words - 1;
+      uint64_t bits = changed_[w];
+      changed_[w] = 0;
+      while (bits) {
+        const uint32_t reg = w * 64 + uint32_t(__builtin_ctzll(bits));
+        bits &= bits - 1;
+        out->push_back({reg, regs_[reg]});
+      }
+    }
+  }
+}
+
 // sub_826A9668: a shader object's literal constants, LOAD_ALU_CONSTANT'd from guest memory into
 // the float constants when the shader is (re)bound. `table` is the object's constant table,
 // `data` the virtual base its offsets are relative to.
-void LoadLiterals(uint32_t* regs, const uint8_t* base, uint32_t table, uint32_t data) {
+void GuestStateTracker::LoadLiterals(const uint8_t* base, uint32_t table, uint32_t data) {
   uint32_t rel = Load32(base, table + 20);
   if (!rel) return;
   uint32_t head = table + rel;
@@ -86,11 +130,9 @@ void LoadLiterals(uint32_t* regs, const uint8_t* base, uint32_t table, uint32_t 
     uint32_t first = 0x4000 + ((index * 4) & 0x7FF);
     count &= 0xFFF;
     if (first + count > 0x4800) count = 0x4800 - first;
-    CopyRegs(regs + first, base, src, count);
+    Copy(first, base, src, count);
   }
 }
-
-}  // namespace
 
 CallEntry ReadDirtyMasks(const uint8_t* base, uint32_t device) {
   CallEntry e;
@@ -120,9 +162,9 @@ void GuestStateTracker::Attach(const uint8_t* base, uint32_t device) {
   static uint32_t attaches = 0;
   if (++attaches <= 8) REXLOG_INFO("PGR4 native state: tracking device {:08X} (was {:08X})", device, device_);
   device_ = device;
-  CopyRegs(regs_ + 0x4000, base, device + dev::kVsConstants, 1024);
-  CopyRegs(regs_ + 0x4400, base, device + dev::kPsConstants, 1024);
-  for (const Block& b : kRegisterBlocks) CopyRegs(regs_ + b.reg, base, device + b.offset, b.count);
+  Copy(0x4000, base, device + dev::kVsConstants, 1024);
+  Copy(0x4400, base, device + dev::kPsConstants, 1024);
+  for (const Block& b : kRegisterBlocks) Copy(b.reg, base, device + b.offset, b.count);
   vs_ = ps_ = {};
   inline_vertices_ = inline_bytes_ = 0;
 }
@@ -150,7 +192,7 @@ void GuestStateTracker::AfterCall(const uint8_t* base, uint32_t fn_addr, const C
     while (flushed) {
       uint32_t k = uint32_t(__builtin_clzll(flushed));
       flushed &= ~(1ull << (63 - k));
-      CopyRegs(regs_ + reg + k * 16, base, device + off + k * 64, 16);
+      Copy(reg + k * 16, base, device + off + k * 64, 16);
     }
   }
 
@@ -158,7 +200,7 @@ void GuestStateTracker::AfterCall(const uint8_t* base, uint32_t fn_addr, const C
   // call the shadow equals what the GPU has for these (the M1 traces show no other
   // differences: the draw flushes whatever is dirty, and Clear/Resolve re-dirty what they
   // overwrite in the stream, so the next draw restores it).
-  for (const Block& b : kRegisterBlocks) CopyRegs(regs_ + b.reg, base, device + b.offset, b.count);
+  for (const Block& b : kRegisterBlocks) Copy(b.reg, base, device + b.offset, b.count);
 
   // Window scissor: sub_8268DEB0 writes PA_SC_WINDOW_OFFSET/SCISSOR_TL/BR straight into the
   // stream from the rectangle SetScissorRect (fn_826904C8) keeps at device+10436/+10440 (15-bit
@@ -168,9 +210,9 @@ void GuestStateTracker::AfterCall(const uint8_t* base, uint32_t fn_addr, const C
   {
     const uint32_t tl = Load32(base, device + dev::kScissorTL), br = Load32(base, device + dev::kScissorBR);
     auto field = [](uint32_t v) { return uint32_t(int32_t(v << 17) >> 17); };
-    regs_[0x2080] = 0;
-    regs_[0x2081] = ((field(tl >> 16) << 16) & 0x3FFF0000u) | (field(tl) & 0x3FFFu);
-    regs_[0x2082] = ((field(br >> 16) << 16) & 0x3FFF0000u) | (field(br) & 0x3FFFu);
+    Put(0x2080, 0);
+    Put(0x2081, ((field(tl >> 16) << 16) & 0x3FFF0000u) | (field(tl) & 0x3FFFu));
+    Put(0x2082, ((field(br >> 16) << 16) & 0x3FFF0000u) | (field(br) & 0x3FFFu));
   }
 
   const bool draw = fn_addr == kFnBeginVertices || fn_addr == kFnDrawVertices ||
@@ -197,14 +239,14 @@ void GuestStateTracker::AfterCall(const uint8_t* base, uint32_t fn_addr, const C
         uint32_t sub = vs + Load32(base, vs + 896 + variant * 8);
         vs_ = {vs, GpuAddress(Load32(base, vs + 32) + Load32(base, sub + 872)), Load32(base, sub + 876) >> 2};
       }
-      if (rebind & (kVsRebind | kPsRebind)) LoadLiterals(regs_, base, vs + 872, Load32(base, vs + 32));
+      if (rebind & (kVsRebind | kPsRebind)) LoadLiterals(base, vs + 872, Load32(base, vs + 32));
     } else {
       vs_ = {};
     }
     if (ps) {
       uint32_t sub = ps + Load32(base, ps + 64);
       ps_ = {ps, GpuAddress(Load32(base, ps + 24) + Load32(base, sub + 40)), Load32(base, sub + 44) >> 2};
-      if (rebind & kPsRebind) LoadLiterals(regs_, base, ps + 40, Load32(base, ps + 24));
+      if (rebind & kPsRebind) LoadLiterals(base, ps + 40, Load32(base, ps + 24));
     } else {
       ps_ = {};
     }
@@ -214,26 +256,26 @@ void GuestStateTracker::AfterCall(const uint8_t* base, uint32_t fn_addr, const C
   switch (fn_addr) {
     case kFnDrawIndexed:   // VGT_INDX_OFFSET = BaseVertexIndex
     case kFnDrawVertices:  // VGT_INDX_OFFSET = StartVertex
-      regs_[0x2102] = r[2];
+      Put(0x2102, r[2]);
       inline_vertices_ = inline_bytes_ = 0;
       break;
     case kFnDrawIndx2Split:  // Swap's internal draw
-      regs_[0x2102] = 0;
+      Put(0x2102, 0);
       break;
     case kFnBeginVertices: {
-      regs_[0x2102] = 0;
+      Put(0x2102, 0);
       uint32_t p = uint32_t(ret);
       if (!p) break;  // no space: nothing was written
       // Vertex fetch 93-95 (fetch constant 31): the inline vertices behind the packets. The
       // D3D re-dirties slot 31 so the next draw restores the shadow's value.
       uint32_t bytes = r[2] * r[3];
-      uint32_t* f = regs_ + 0x4800 + 31 * 6;
-      f[0] = 1;
-      f[1] = 0;
-      f[2] = 1;
-      f[3] = 0;
-      f[4] = GpuAddress(p) | 3;
-      f[5] = 0x10000002u | (((bytes >> 2) & 0xFFFFFFu) << 2);
+      const uint32_t f = 0x4800 + 31 * 6;
+      Put(f + 0, 1);
+      Put(f + 1, 0);
+      Put(f + 2, 1);
+      Put(f + 3, 0);
+      Put(f + 4, GpuAddress(p) | 3);
+      Put(f + 5, 0x10000002u | (((bytes >> 2) & 0xFFFFFFu) << 2));
       inline_vertices_ = GpuAddress(p);
       inline_bytes_ = bytes;
       break;

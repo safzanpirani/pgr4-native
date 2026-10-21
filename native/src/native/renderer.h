@@ -12,6 +12,17 @@
 // are called on that thread, after the original guest function returned, and are serialized
 // by the renderer. Modules may assume single-threaded access from the On* calls.
 //
+// With --pgr4_native_render_thread (default off; off keeps everything on the guest thread as
+// above) the On* calls only capture, on the guest thread, what each call reads from guest
+// memory: the register changes since the last draw (the tracker's TakeChanges), the
+// DrawState, DrawRenderer::Prepare's shader lookup and vertex/index copies,
+// and the decoded Clear/Resolve/Swap arguments. They queue it in batches to the render thread
+// ("PGR4 native render"), which replays it into the modules with its own copy of the register
+// file. From then on the command list, the D3D12 objects and every module's state belong to
+// that thread (DrawRenderer's vertex upload pool and shader lookup stay on the guest thread).
+// The guest thread blocks at Swap while the render thread is more than one frame behind, and
+// waits for the render thread to finish the Swaps around a capture (present.h).
+//
 // Owner: Integrator (M2 owner #1). Other modules (d3d_state, shader_*, textures,
 // render_targets, resolve, draw, present) plug in behind these calls; ask the owner for
 // changes to this header.
@@ -29,6 +40,7 @@ struct ID3D12GraphicsCommandList;
 
 REXCVAR_DECLARE(bool, pgr4_native);             // master switch, off by default
 REXCVAR_DECLARE(std::string, pgr4_native_csv);  // per-frame CSV of the native path ("" = off)
+REXCVAR_DECLARE(bool, pgr4_native_render_thread);  // record on a render thread (see above)
 
 namespace pgr4::native {
 
@@ -38,6 +50,11 @@ class Presenter;
 class RenderTargets;
 class Resolver;
 class TextureCache;
+struct ClearCall;
+struct DrawPrep;
+struct DrawState;
+struct ResolveParams;
+struct SwapCall;
 
 // Guest D3D entry points the native path receives (addresses in the base-disc default.xex;
 // names from native/src/d3d_surface.inc).
@@ -82,6 +99,10 @@ struct FrameStats {
   uint64_t state_fail = 0;                             // draws ReadDrawState rejected
   uint64_t draw_ns = 0, clear_ns = 0, resolve_ns = 0;  // CPU time inside the On* calls
   uint64_t swap_ns = 0;                                // OnSwap: record, submit, present
+  // Guest thread: time in the On* calls (render thread mode: capturing and queueing) and the
+  // part of it spent waiting for the render thread.
+  uint64_t hook_ns = 0, hook_wait_ns = 0;
+  uint64_t reg_writes = 0;  // render thread mode: register values replayed
 };
 
 class NativeRenderer {
@@ -102,9 +123,9 @@ class NativeRenderer {
   ID3D12Device* d3d12() const;
   ID3D12CommandQueue* queue() const;
   // The frame's direct command list: open from the previous Swap until OnSwap closes and
-  // submits it. Record into it from the On* calls only.
+  // submits it. Record into it from the On* calls only (the render thread, in that mode).
   ID3D12GraphicsCommandList* command_list() const;
-  // Swaps seen so far (= index of the frame being recorded).
+  // Swaps recorded so far (= index of the frame being recorded).
   uint64_t frame_index() const { return frame_index_; }
   // Fence value OnSwap will signal for the frame being recorded; a resource last used in this
   // frame may be freed once device().completed_fence() >= this.
@@ -125,6 +146,21 @@ class NativeRenderer {
     if (!frame_begun_) BeginFrameModules(base);
   }
   void BeginFrameModules(const uint8_t* base);
+  // The recording half of the On* calls (on the guest thread, or the render thread).
+  void ExecuteDraw(const DrawState& state, const DrawPrep* prep);
+  void ExecuteClear(const ClearCall& clear);
+  void ExecuteResolve(const ResolveParams& p);
+  void ExecuteSwap(const SwapCall& swap);
+  // Render thread mode.
+  struct Queue;
+  void QueueDraw(const uint8_t* base, const HookArgs& args);
+  void QueueClear(const uint8_t* base, const HookArgs& args);
+  void QueueResolve(const uint8_t* base, const HookArgs& args);
+  void QueueSwap(const uint8_t* base, const HookArgs& args);
+  void RenderThreadMain();
+
+  const uint8_t* base_ = nullptr;  // guest memory base (constant; set before first use)
+  std::unique_ptr<Queue> queue_;   // render thread mode only
 
   std::unique_ptr<D3D12Device> device_;
   std::unique_ptr<RenderTargets> rt_;

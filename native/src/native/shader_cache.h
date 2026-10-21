@@ -1,11 +1,14 @@
 // Ucode -> DXBC cache of the native renderer. Shaders are keyed by the XXH3 hash of their
 // guest (big-endian) ucode, the same ucode_data_hash the Xenos plugin uses in its dumps and in
 // its shader storage (.xsh), and translations by (shader, modification).
-// Not thread-safe: called from the thread that runs the D3D hooks.
+// Threading: Translate on one thread (the renderer's recording thread). Load may also be called
+// from the guest thread (render thread mode: DrawRenderer::Prepare) while the recording thread
+// calls it from Prewarm, so it takes a lock.
 #pragma once
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <unordered_map>
 
 #include <rex/string/buffer.h>
@@ -43,6 +46,7 @@ class ShaderCache {
  private:
   DxbcShaderTranslator translator_;
   rex::string::StringBuffer disasm_buffer_;
+  std::mutex load_mutex_;  // shaders_, disasm_buffer_, the Load half of stats_
   std::unordered_map<uint64_t, std::unique_ptr<DxbcShader>> shaders_;
   ShaderCacheStats stats_;
 };

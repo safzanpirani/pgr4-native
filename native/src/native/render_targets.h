@@ -90,6 +90,15 @@ struct ClearParams {
   std::vector<D3D12_RECT> rects;  // empty: whole surface
 };
 
+// One Clear / ClearF call, decoded from its arguments and the device (guest memory).
+struct ClearCall {
+  ClearParams p;
+  SurfaceRegs regs;
+  uint32_t bound_colors = 0;  // bit i: a surface is bound as render target i
+  bool depth_bound = false;
+  uint32_t height = 0;
+};
+
 class RenderTargets {
  public:
   RenderTargets();
@@ -106,6 +115,8 @@ class RenderTargets {
   // Guest Clear / ClearF (HookFn kClear / kClearF), after the guest call returned: clears the
   // host targets of the surfaces bound in the device's register shadow.
   void OnClear(ID3D12GraphicsCommandList* list, const uint8_t* base, const HookArgs& args);
+  // OnClear's decoding half (reads guest memory only); false: nothing to clear.
+  static bool DecodeClear(const uint8_t* base, const HookArgs& args, ClearCall* out);
   void Clear(ID3D12GraphicsCommandList* list, const SurfaceRegs& regs,
              uint32_t bound_colors, bool depth_bound, uint32_t height, const ClearParams& p);
 

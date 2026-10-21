@@ -24,11 +24,17 @@ every row.
 
 | | Native renderer | Xenos plugin |
 |---|---|---|
-| Windows | 129 fps with the render thread, 96 fps without | 126 fps |
-| Linux, Proton | 112-116 fps with the render thread, 91-92 fps without | 113-114 fps |
-| Proton, game limited to 8 efficiency cores | 80 fps with the render thread, 57 fps without | 72 fps |
+| Windows, release flags | **143 fps** with the render thread | 126 fps |
+| Windows, debug decoder on | 129 fps with the render thread, 96 fps without | 126 fps |
+| Linux, Proton, debug decoder on | 112-116 fps with the render thread, 91-92 fps without | 113-114 fps |
+| Proton, 8 efficiency cores, debug decoder on | 80 fps with the render thread, 57 fps without | 72 fps |
 | CPU cores kept busy (Windows) | about 1.4 with the render thread | about 2 |
 | Race image against the Xenos plugin | 31-33 dB PSNR | reference |
+
+The debug decoder is `--pgr4_d3d_tap`, which decodes the game's command buffer at every D3D call
+for traces and checks. Most measurements below were taken with it on, and it costs the native
+path about 0.8 ms per frame. With it off, native with the render thread takes 12.6 % less time
+per frame than the Xenos plugin (see [Windows](#windows)).
 
 - Title screen, menus and the St Petersburg race render. That route is the only one tested.
 - The car's rear spoiler is missing.
@@ -61,6 +67,7 @@ every row.
 - Frame time is the average over the 40 seconds after the race starts, taken from the game's own
   log (`native/tools/perf_fps.py`). Runs are uncapped (`--vsync=false
   --d3d12_present_vsync=false`), which does not change PGR4's game speed.
+- Unless a table says otherwise, runs have the debug decoder (`--pgr4_d3d_tap`) on.
 - Two runs of the same build differed by 8 % in one test, because the scene at a given second
   changes a little from run to run. To compare two builds or two flag sets, runs alternate
   (A, B, B, A, ...) and `native/tools/ab_compare.py` compares them in 4-second bins at the same
@@ -70,12 +77,20 @@ every row.
 
 | Configuration | ms per frame | fps |
 |---|---|---|
+| Native, render thread on, debug decoder off | 6.99 | 143 |
+| Xenos plugin, debug decoder off | 7.94 | 126 |
 | Native, render thread on | 7.76 | 129 |
 | Xenos plugin | 7.95 | 126 |
 | Native, render thread off | 10.46 | 96 |
 
-Paired comparison on the same build: turning the render thread on takes frame time from 11.09
-to 8.16 ms, -26.3 % (95 % interval -29.3 to -23.2 %).
+Paired comparisons on the same build:
+
+- Release flags (decoder off), Xenos against native with the render thread: native takes
+  12.6 % less time per frame (95 % interval 3.5 to 21.8 %, one pair of runs). The gap is 2 to
+  2.5 ms in the busy stretches of the race and close to zero in the light ones, where the game's
+  own code sets the frame time for both.
+- Turning the render thread on (decoder on) takes frame time from 11.09 to 8.16 ms, -26.3 %
+  (95 % interval -29.3 to -23.2 %).
 
 How the native frame rate got there, with the Xenos plugin on the same build for reference:
 

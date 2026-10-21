@@ -57,6 +57,11 @@ per frame than the Xenos plugin (see [Windows](#windows)).
   that is about 43 % busy.
 - The game's own code takes about 8 ms per frame on the 13900K. That sets the floor for both
   renderers.
+- Part of that floor is the game's D3D library. Each hook calls the original D3D function
+  first, and that function still builds the command buffer the Xenos plugin would read. In a
+  profiled race run (`guest_d3d` stage, render thread off) this took 1.47 ms of a 9.27 ms frame.
+  UnleashedRecomp and MarathonRecomp replace those functions instead of calling them, and
+  doing the same here is the largest saving left on the game thread.
 
 ## Performance
 
@@ -187,6 +192,7 @@ PSNR or more. Race frames score 31-33 dB and menus 34-40 dB.
 | Lost frames at the title screen | The game creates a second D3D device | Follow the device that Swap and the draws use |
 | Clip plane mismatches | The clip-plane register block is 8 registers and the planes flush from a different device field | Map the block correctly |
 | 14 ms per frame lost | Texture untiling wrote into write-combined upload memory and the format conversion read it back (about 55 ns per byte) | Convert in a cached scratch row, then copy whole rows out |
+| Depth bias missing on some draws (found by reading the code, not seen in the image check) | `SetPipelineState` loads the pipeline's depth bias even when the pipeline uses dynamic depth bias, and the renderer kept its cached value across pipeline changes | Reset the cached bias after each pipeline change |
 
 ## How it works
 
@@ -225,7 +231,8 @@ the recompiled C++ that the build generates from `default.xex` must not be publi
    Add `--pgr4_native_render_thread` to the `-Extra` flags for the faster path. `run.ps1`
    starts the game in the interactive desktop session through a scheduled task, so it also
    works over SSH. `-Action stop` closes it. The game's executable is
-   `<tree>\run\runtime\pgr4_recompiled.exe`.
+   `<tree>\run\runtime\pgr4_recompiled.exe`. `-Tap` turns on the debug decoder
+   (`--pgr4_d3d_tap`), which costs about 0.8 ms per frame.
 
 `build.ps1` expects `native\` and `instrument\` side by side, as in this repository.
 

@@ -26,6 +26,7 @@
 // Built only into the pgr4-native native checkout (native/build.ps1).
 
 #include "native/d3d_state.h"
+#include "native/guest_d3d.h"
 #include "native/profile.h"
 #include "native/renderer.h"
 
@@ -889,10 +890,15 @@ inline void OnHook(FnId id, PPCContext& ctx, uint8_t* base, F original) {
   namespace nat = pgr4::native;
   nat::NativeRenderer* r = nat::NativeRenderer::Get();
   const bool track = r || g_tap.enabled || REXCVAR_GET(pgr4_d3d_tap);
-  auto run = [id, track, original](PPCContext& c, uint8_t* b) {
+  // --pgr4_native_replace_draws: native/guest_d3d.h replaces DrawIndexedVertices' body.
+  auto body = [id, original](PPCContext& c, uint8_t* b) {
+    if (id == kFn_8269ADD8 && nat::guest_d3d::DrawIndexed(c, b)) return;
+    original(c, b);
+  };
+  auto run = [id, track, body](PPCContext& c, uint8_t* b) {
     const uint32_t fn = kFns[id].addr;
     if (!track || !c.r3.u32 || !nat::IsStateFlushingFn(fn)) {
-      RunOriginal(original, c, b);
+      RunOriginal(body, c, b);
       return;
     }
     const uint32_t rr[8] = {c.r3.u32, c.r4.u32, c.r5.u32, c.r6.u32,
@@ -902,7 +908,7 @@ inline void OnHook(FnId id, PPCContext& ctx, uint8_t* base, F original) {
       nat::profile::Scope scope(nat::profile::kTrack);
       e = nat::ReadDirtyMasks(b, rr[0]);
     }
-    RunOriginal(original, c, b);
+    RunOriginal(body, c, b);
     nat::profile::Scope scope(nat::profile::kTrack);
     ++nat::profile::g.track_calls;
     nat::GuestState().AfterCall(b, fn, e, rr, c.r3.u64);

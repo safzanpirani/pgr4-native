@@ -1,0 +1,6 @@
+# Build trees, logs and anything game-derived stay out of this repository.
+out/
+generated/
+*.log
+*.csv
+__pycache__/

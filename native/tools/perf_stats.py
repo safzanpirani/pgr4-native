@@ -27,7 +27,8 @@ tot = 0.0
 for k in cols:
     vals = [f(r, k) for r in sel]
     m = sum(vals) / n
-    if not k.startswith("st_tex_"):  # nested inside st_textures
+    # st_tex_* are nested inside st_textures; st_guest_d3d overlaps st_track (hook side).
+    if not k.startswith("st_tex_") and k != "st_guest_d3d_us":
         tot += m
     print(f"  {k:22s} {m:10.1f} {statistics.median(vals):10.1f} {1000*m/max(draws,1):10.0f}")
 print(f"  sum of stages {tot:.1f} us/frame")

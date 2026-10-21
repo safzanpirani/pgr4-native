@@ -2157,6 +2157,9 @@ void DrawRenderer::Impl::Draw(const uint8_t* base, const DrawState& s, const Dra
   if (bound_pso != pso) {
     list->SetPipelineState(pso);
     bound_pso = pso;
+    // SetPipelineState loads the pipeline's depth bias, dynamic or not (DirectX-Specs
+    // VulkanOn12, "initial dynamic depth bias state"). These pipelines are keyed with zero bias.
+    if (dynamic_depth_bias) bound_depth_bias = bound_slope_bias = 0.0f;
   }
   if (bound_topology != topology) {
     list->IASetPrimitiveTopology(topology);

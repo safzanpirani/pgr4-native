@@ -864,6 +864,21 @@ constexpr NativeClass NativeClassOf(Cat c) {
 thread_local uint32_t t_native_depth = 0;  // active draw/clear/resolve/Swap calls
 thread_local bool t_pending_vertices = false;
 thread_local pgr4::native::HookArgs t_pending_args;
+thread_local uint32_t t_original_depth = 0;  // hooked originals running on this thread
+
+// Runs a hooked guest D3D function. The outermost one is timed as profile::kGuestD3d (nested
+// hooked calls and their tracking are inside that time).
+template <typename F>
+inline void RunOriginal(F original, PPCContext& c, uint8_t* b) {
+  namespace nat = pgr4::native;
+  if (t_original_depth++ == 0 && nat::profile::g.on) {
+    nat::profile::Scope scope(nat::profile::kGuestD3d);
+    original(c, b);
+  } else {
+    original(c, b);
+  }
+  --t_original_depth;
+}
 
 // The state tracker (native/d3d_state) needs the dirty masks at the entry of every flushing
 // call, at every depth, and the call's exit before anything reads the state (the tap's per-draw
@@ -877,7 +892,7 @@ inline void OnHook(FnId id, PPCContext& ctx, uint8_t* base, F original) {
   auto run = [id, track, original](PPCContext& c, uint8_t* b) {
     const uint32_t fn = kFns[id].addr;
     if (!track || !c.r3.u32 || !nat::IsStateFlushingFn(fn)) {
-      original(c, b);
+      RunOriginal(original, c, b);
       return;
     }
     const uint32_t rr[8] = {c.r3.u32, c.r4.u32, c.r5.u32, c.r6.u32,
@@ -887,7 +902,7 @@ inline void OnHook(FnId id, PPCContext& ctx, uint8_t* base, F original) {
       nat::profile::Scope scope(nat::profile::kTrack);
       e = nat::ReadDirtyMasks(b, rr[0]);
     }
-    original(c, b);
+    RunOriginal(original, c, b);
     nat::profile::Scope scope(nat::profile::kTrack);
     ++nat::profile::g.track_calls;
     nat::GuestState().AfterCall(b, fn, e, rr, c.r3.u64);

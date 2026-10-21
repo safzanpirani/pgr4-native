@@ -8,7 +8,7 @@
 
 #include <cstring>
 
-REXCVAR_DEFINE_BOOL(pgr4_native_replace_draws, false, "PGR4 native",
+REXCVAR_DEFINE_BOOL(pgr4_native_replace_draws, true, "PGR4 native",
                     "With --pgr4_native_primary, replace the guest D3D's DrawIndexedVertices "
                     "(sub_8269ADD8): keep the device state, skip its PM4 packets");
 REXCVAR_DECLARE(bool, pgr4_native_primary);

@@ -20,12 +20,13 @@ spoiler, a known bug.
 ## Summary (2026-10-22)
 
 Measured on an i9-13900K with an RTX 3090, St Petersburg street race, uncapped. Within each row
-both columns come from the same build. The first row is the current build; the others were
-measured on 2026-10-21 before the recompiler changes below.
+both columns come from the same build, except the first row's Xenos number, which comes from the
+previous build of the same night (the change between them only affects the native path). The
+other rows were measured on 2026-10-21 before the recompiler changes below.
 
 | | Native renderer | Xenos plugin |
 |---|---|---|
-| Windows, release flags | **166 fps** with the render thread | 125 fps |
+| Windows, release flags | **186 fps** with the render thread | 125 fps |
 | Windows, release flags, 2026-10-21 build | 143 fps with the render thread | 126 fps |
 | Windows, debug decoder on | 129 fps with the render thread, 96 fps without | 126 fps |
 | Linux, Proton, debug decoder on | 112-116 fps with the render thread, 91-92 fps without | 113-114 fps |
@@ -35,8 +36,8 @@ measured on 2026-10-21 before the recompiler changes below.
 
 The debug decoder is `--pgr4_d3d_tap`, which decodes the game's command buffer at every D3D call
 for traces and checks. It costs the native path about 0.8 ms per frame. With it off, native with
-the render thread takes 25 % less time per frame than the Xenos plugin on the current build
-(6.02 against 8.02 ms, see [Windows](#windows)).
+the render thread takes 33 % less time per frame than the Xenos plugin (5.36 against 8.02 ms, see
+[Windows](#windows)).
 
 - Title screen, menus and the St Petersburg race render. That route is the only one tested.
 - The car's rear spoiler is missing.
@@ -68,10 +69,11 @@ the render thread takes 25 % less time per frame than the Xenos plugin on the cu
 - Part of that floor is the game's D3D library. Each hook calls the original D3D function
   first, and that function still builds the command buffer the Xenos plugin would read.
   UnleashedRecomp and MarathonRecomp replace those functions instead of calling them. The first
-  piece of that is here behind `--pgr4_native_replace_draws` (off by default): in primary mode
-  DrawIndexedVertices, 91-98 % of the game's draws, no longer builds command packets. On the same
-  exe it took frame time from 6.08 to 5.55 ms, 8.5 % less (95 % interval 2.5 to 14.4 %). It
-  stays off until a race image check with it on is clean.
+  piece of that is here, `--pgr4_native_replace_draws` (on by default since 2026-10-22): in
+  primary mode DrawIndexedVertices, 91-98 % of the game's draws, no longer builds command packets.
+  On the same exe it took frame time from 6.08 to 5.55 ms, 8.5 % less (95 % interval 2.5 to
+  14.4 %), and a recorded race next to the Xenos plugin showed no image difference beyond the
+  known spoiler bug.
 
 ## Performance
 

@@ -36,7 +36,7 @@ REXCVAR_DEFINE_INT32(pgr4_native_height, 720, "PGR4 native", "Debug window heigh
 REXCVAR_DEFINE_BOOL(pgr4_native_profile, false, "PGR4 native",
                     "Per-stage CPU time of the draw path (RDTSC), appended to the native CSV as "
                     "st_<stage>_us columns and to the stats log line");
-REXCVAR_DEFINE_BOOL(pgr4_native_render_thread, false, "PGR4 native",
+REXCVAR_DEFINE_BOOL(pgr4_native_render_thread, true, "PGR4 native",
                     "Record the native frames on their own thread (\"PGR4 native render\"): the "
                     "game thread only copies what each D3D call reads from guest memory and "
                     "queues it, at most one frame ahead of the render thread");

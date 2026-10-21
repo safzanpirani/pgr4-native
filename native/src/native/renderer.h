@@ -12,7 +12,7 @@
 // are called on that thread, after the original guest function returned, and are serialized
 // by the renderer. Modules may assume single-threaded access from the On* calls.
 //
-// With --pgr4_native_render_thread (default off; off keeps everything on the guest thread as
+// With --pgr4_native_render_thread (default on; false keeps everything on the guest thread as
 // above) the On* calls only capture, on the guest thread, what each call reads from guest
 // memory: the register changes since the last draw (the tracker's TakeChanges), the
 // DrawState, DrawRenderer::Prepare's shader lookup and vertex/index copies,

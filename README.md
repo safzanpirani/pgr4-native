@@ -38,8 +38,9 @@ per frame than the Xenos plugin (see [Windows](#windows)).
 
 - Title screen, menus and the St Petersburg race render. That route is the only one tested.
 - The car's rear spoiler is missing.
-- The render thread (`--pgr4_native_render_thread`) is off by default until an image bug it
-  causes is fixed (see [Image accuracy](#image-accuracy)).
+- The render thread (`--pgr4_native_render_thread`) is on by default. In one race image check
+  out of three it draws some wrong geometry (see [Image accuracy](#image-accuracy)); set it to
+  `false` for the slower single-thread path.
 - Not run on a Steam Deck yet.
 - The game runs at 30 fps by default; MTR-PGR4's `--pgr4_60fps` makes it 60, which has not been
   tried with this renderer yet. The uncapped numbers above measure how much headroom there is.
@@ -208,8 +209,8 @@ PSNR or more. Race frames score 31-33 dB and menus 34-40 dB.
   render targets; resolves copy them into host textures that later draws sample.
 - Pipelines (`draw`, `pipeline_store`): pipeline states compile on a worker thread and persist
   across runs in an `ID3D12PipelineLibrary` under the runtime's cache folder.
-- With `--pgr4_native_render_thread`, the game thread only captures each call and its state; a
-  render thread records and submits the D3D12 work.
+- With `--pgr4_native_render_thread` (the default), the game thread only captures each call and
+  its state; a render thread records and submits the D3D12 work.
 - `present` presents the guest's front buffer into the game window or a debug window.
 
 Several files port Xenia/ReXGlue code (BSD-3-Clause), among them `draw`, `render_targets`,
@@ -228,7 +229,7 @@ the recompiled C++ that the build generates from `default.xex` must not be publi
    patches, adds the hooks and `native\src\native\` to the game, then builds:
    `pwsh -File native\build.ps1 -Root C:\recomp\builds\pgr4 -Game <disc folder> -Dest <tree>`
 3. Run it: `pwsh -File native\run.ps1 -Action start -Dest <tree> -Game <disc folder> -Native -Extra "--pgr4_native_primary"`.
-   Add `--pgr4_native_render_thread` to the `-Extra` flags for the faster path. `run.ps1`
+   Add `--pgr4_native_render_thread=false` to the `-Extra` flags for the single-thread path. `run.ps1`
    starts the game in the interactive desktop session through a scheduled task, so it also
    works over SSH. `-Action stop` closes it. The game's executable is
    `<tree>\run\runtime\pgr4_recompiled.exe`. `-Tap` turns on the debug decoder
@@ -245,7 +246,7 @@ Under Proton the same Windows build runs as it is: start `pgr4_recompiled.exe` w
 |---|---|---|
 | `--pgr4_native` | false | Run the native renderer beside the Xenos plugin, in a debug window |
 | `--pgr4_native_primary` | false | The native renderer is the game's output; implies `--pgr4_native` |
-| `--pgr4_native_render_thread` | false | Record and submit on a render thread; the game thread only captures each call |
+| `--pgr4_native_render_thread` | true | Record and submit on a render thread; the game thread only captures each call |
 | `--pgr4_native_async_pipelines` | true | Compile new pipelines on a worker thread; draws wait for theirs |
 | `--pgr4_native_pipeline_cache` | true | Keep pipelines across runs |
 | `--pgr4_native_dynamic_depth_bias` | true | Set polygon offset per draw instead of per pipeline |
@@ -274,7 +275,7 @@ It also has a texture untiling harness and an offline shader translation test.
 
 ## What's next
 
-- Fix the render thread's wrong geometry and turn it on by default.
+- Fix the render thread's wrong geometry.
 - Find out whether the row-480 jump is the tile boundary, and whether it explains the spoiler.
 - Run on a Steam Deck, and measure a GPU-limited case.
 - Cut the remaining race-start work: first vertex copies, untiling the first submit waits for.

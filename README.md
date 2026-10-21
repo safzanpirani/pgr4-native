@@ -27,7 +27,12 @@ The target is Proton on the Steam Deck at 1280x800 and 60 fps.
   29.5 dB, which is under the 30 dB pass mark.
 - A whole run from the title screen to the race has three frames of 50 ms or more. Two of them
   are start-up and a loading screen.
-- Not yet run under Proton or on a Steam Deck.
+- Under Proton on Linux (GE-Proton 11-11, so vkd3d-proton), same hardware and build: 8.7-8.9 ms
+  per frame with the render thread, 8.8-8.9 ms with the Xenos plugin and 10.9-11.0 ms without
+  the render thread. Race captures match the Xenos plugin's at 31.5-31.7 dB, as on Windows.
+  Pinned to eight of the CPU's efficiency cores, the native renderer with the render thread runs
+  at 80 fps and the Xenos plugin at 72 fps.
+- Not yet run on a Steam Deck.
 
 ## How it works
 

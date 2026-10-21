@@ -335,4 +335,4 @@ The code, tooling and docs are developed in a private repository and published h
 automatically. History starts at the first public commit. Code comments and docs sometimes
 point to development notes that are not published.
 
-Third-party notices: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+License: MIT ([LICENSE](LICENSE)). Third-party notices: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

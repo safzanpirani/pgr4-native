@@ -17,11 +17,16 @@ The target is Proton on the Steam Deck at 1280x800 and 60 fps.
   `native/rexglue-native-primary.patch`). Title screen, menus and the St Petersburg race render.
 - On race frames the front buffer matches the Xenos plugin's at 31-33 dB PSNR. The car's rear
   spoiler is missing; that is a known bug.
-- Measured on an i9-13900K with an RTX 3090, uncapped, St Petersburg race, same build for both:
-  10.8 ms per frame (92 fps) with the native renderer and 8.1 ms (123 fps) with the Xenos plugin.
-  The game's own code takes about 8 ms per frame on the game thread. The native renderer adds
-  about 2.7 ms on that thread; a render thread that moves this work off it measured 7.9 ms per
-  frame (127 fps) and is being merged.
+- Measured on an i9-13900K with an RTX 3090, uncapped, St Petersburg race, same build for all
+  three: 10.5 ms per frame (96 fps) with the native renderer, 8.0 ms (126 fps) with the Xenos
+  plugin, and 7.8 ms (129 fps) with the native renderer and `--pgr4_native_render_thread`. The
+  game's own code takes about 8 ms per frame on the game thread. The render thread moves the
+  native work (about 2.7 ms per frame) off it and uses about 43 % of another core. The Xenos
+  plugin keeps two cores busy.
+- The render thread is off by default for now. With it on, one of three oracle captures drops to
+  29.5 dB, which is under the 30 dB pass mark.
+- A whole run from the title screen to the race has three frames of 50 ms or more. Two of them
+  are start-up and a loading screen.
 - Not yet run under Proton or on a Steam Deck.
 
 ## How it works
@@ -69,6 +74,7 @@ the recompiled C++ that the build generates from `default.xex` must not be publi
 | `--pgr4_native` | false | Run the native renderer beside the Xenos plugin, in a debug window |
 | `--pgr4_native_primary` | false | The native renderer is the game's output; implies `--pgr4_native` |
 | `--pgr4_native_async_pipelines` | true | Compile new pipelines on a worker thread; draws wait for theirs |
+| `--pgr4_native_render_thread` | false | Record and submit on a render thread; the game thread only captures each call |
 | `--pgr4_native_pipeline_cache` | true | Keep pipelines across runs |
 | `--pgr4_native_dynamic_depth_bias` | true | Set polygon offset per draw instead of per pipeline |
 | `--pgr4_native_csv=<file>` | off | Per-frame counters and CPU times |

@@ -583,6 +583,8 @@ struct DrawRenderer::Impl {
   std::unique_ptr<std::atomic<uint64_t>[]> valid;
   void* invalidation_handle = nullptr;
   using PendingCopy = VertexCopy;
+  // Without the render thread: the copies of the draw being recorded. With it, Prepare
+  // (guest thread) writes into the batch's vector instead: this one is the render thread's.
   std::vector<PendingCopy> copies;
   // Fence (or Prepare's tag) RequestRange tags vertex upload memory with.
   uint64_t upload_fence = 0;
@@ -789,13 +791,14 @@ struct DrawRenderer::Impl {
   void Draw(const uint8_t* base, const DrawState& s, const DrawPrep* prep);
   DxbcShader* LoadShader(ShaderMemo* table, ShaderMemo*& last, const ShaderRef& ref,
                          xenos::ShaderType type);
-  bool RequestVertices(const DrawState& s, const DxbcShader& vs);
+  // Copies go to the end of `out`.
+  bool RequestVertices(const DrawState& s, const DxbcShader& vs, std::vector<PendingCopy>& out);
   void Prepare(const DrawState& s, uint64_t tag, DrawPrep* prep, std::vector<VertexCopy>* out);
   // A triangle fan as a host triangle list (v1, v2, v0), (v2, v3, v0)... like the plugin's
   // primitive processor; guest indices are copied raw (the VS still swaps them).
   void WriteFanIndices(const DrawState& s, uint32_t count, bool wide, uint8_t* out) const;
   void ResetListState();
-  bool RequestRange(uint32_t start, uint32_t length, bool watch);
+  bool RequestRange(uint32_t start, uint32_t length, bool watch, std::vector<PendingCopy>& out);
   void FlushCopies(ID3D12GraphicsCommandList* list);
   void TransitionShared(ID3D12GraphicsCommandList* list, D3D12_RESOURCE_STATES to);
   // Uploads cb.size bytes of `data` unless cb.gpu is current, and binds it at `root_index`.
@@ -1022,7 +1025,8 @@ void DrawRenderer::Impl::TransitionShared(ID3D12GraphicsCommandList* list,
   shared_state = to;
 }
 
-bool DrawRenderer::Impl::RequestRange(uint32_t start, uint32_t length, bool watch) {
+bool DrawRenderer::Impl::RequestRange(uint32_t start, uint32_t length, bool watch,
+                                      std::vector<PendingCopy>& out) {
   if (!length) return true;
   if (start >= kSharedMemorySize || kSharedMemorySize - start < length) {
     DRAW_LOG_ONCE(log_upload, "PGR4 native draw: range {:08X}+{:X} outside physical memory",
@@ -1034,7 +1038,7 @@ bool DrawRenderer::Impl::RequestRange(uint32_t start, uint32_t length, bool watc
     UploadPool::Alloc a;
     if (!vertex_upload.Allocate(size, 16, fence, &a)) return false;
     std::memcpy(a.cpu, membase + from, size);
-    copies.push_back({a.resource, a.offset, from, size});
+    out.push_back({a.resource, a.offset, from, size});
     if (threaded) {
       prep_upload_bytes += size;
       ++prep_uploads;
@@ -1398,8 +1402,9 @@ DxbcShader* DrawRenderer::Impl::LoadShader(ShaderMemo* table, ShaderMemo*& last,
 }
 
 // Vertex ranges the VS fetches and the index range (not for fans: their indices are read
-// directly) into `copies`.
-bool DrawRenderer::Impl::RequestVertices(const DrawState& s, const DxbcShader& vs) {
+// directly) into `out`.
+bool DrawRenderer::Impl::RequestVertices(const DrawState& s, const DxbcShader& vs,
+                                         std::vector<PendingCopy>& out) {
   const RegisterFile& regs = *reinterpret_cast<const RegisterFile*>(s.regs);
   const Shader::ConstantRegisterMap& vmap = vs.constant_register_map();
   for (uint32_t w = 0; w < 3; ++w) {
@@ -1416,11 +1421,11 @@ bool DrawRenderer::Impl::RequestVertices(const DrawState& s, const DxbcShader& v
       }
       const uint32_t start = f.address << 2, size = f.size << 2;
       const bool inline_data = s.inline_vertices && start == s.inline_vertices;
-      if (!RequestRange(start, size, !inline_data)) return false;
+      if (!RequestRange(start, size, !inline_data, out)) return false;
     }
   }
   if (s.indexed && xenos::PrimitiveType(s.primitive) != xenos::PrimitiveType::kTriangleFan)
-    return RequestRange(s.index_address, s.count * (s.index_32bit ? 4u : 2u), true);
+    return RequestRange(s.index_address, s.count * (s.index_32bit ? 4u : 2u), true, out);
   return true;
 }
 
@@ -1434,10 +1439,9 @@ void DrawRenderer::Impl::Prepare(const DrawState& s, uint64_t tag, DrawPrep* pre
   if (!prep->vs) return;
   upload_fence = tag;
   const bool indexed_ok = !s.indexed || s.index_address;
-  prep->upload_ok = indexed_ok && RequestVertices(s, *prep->vs);
-  // Copies made before a failed range still go out: their pages are marked valid already.
-  out->insert(out->end(), copies.begin(), copies.end());
-  copies.clear();
+  // Straight into the batch: copies made before a failed range still go out (their pages
+  // are marked valid already).
+  prep->upload_ok = indexed_ok && RequestVertices(s, *prep->vs, *out);
   // Triangle fans: host indices from the guest's now (Draw reads them from here).
   const uint32_t count = s.count;
   if (prep->upload_ok && xenos::PrimitiveType(s.primitive) == xenos::PrimitiveType::kTriangleFan &&
@@ -2109,7 +2113,7 @@ void DrawRenderer::Impl::Draw(const uint8_t* base, const DrawState& s, const Dra
   const bool fan = prim == xenos::PrimitiveType::kTriangleFan;
   if (!prep) {
     upload_fence = r.frame_fence();
-    if (!RequestVertices(s, *vs)) {
+    if (!RequestVertices(s, *vs, copies)) {
       copies.clear();
       ++stats.failed;
       return;

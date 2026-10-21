@@ -84,8 +84,11 @@ the recompiled C++ that the build generates from `default.xex` must not be publi
 
 `native/tools/` has the scripts used to measure and check the renderer: `perf_stats.py` (stage
 costs per draw from the CSV), `perf_hitch.py` (slow frames and their causes), `perf_fps.py`
-(frame time from the game log), `compare_resolves.py` (resolve outputs against the Xenos
-plugin's), a texture untiling harness and an offline shader translation test.
+(frame time from the game log), `ab_compare.py` (two builds or flag sets compared in matched
+time bins of the same route, with a 95 % interval), `oracle_diff.py` (side-by-side, heatmap and
+per-tile PSNR of native and Xenos captures of the same frame), `compare_resolves.py` (resolve
+outputs against the Xenos plugin's), a texture untiling harness and an offline shader
+translation test.
 
 ## About this repository
 

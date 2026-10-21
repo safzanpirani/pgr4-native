@@ -176,15 +176,25 @@ if (Want 'game') {
         $gamePath = $Game.Replace('\', '/')
         $content = $content -replace 'game_root = "[^"]*"', ('game_root = "' + $gamePath + '"')
         $content = $content -replace 'file_path = "[^"]*"', ('file_path = "' + $gamePath + '/default.xex"')
-        # Register-as-local codegen (perf plan slice 0, rule 17 in the pgr4-native skill's
-        # native-renderer-performance.md): guest CR, CTR, XER and the non-volatile registers become
-        # C++ locals instead of PPCContext fields, and the register save/restore helpers vanish.
-        # Arguments and r1 stay in ctx. Same four options as prototype-switch on ReXGlue; skip_msr
-        # and reserved_as_local stay off.
-        if ($content -match '(?m)^\s*(cr|ctr|xer|non_volatile|non_argument|reserved)_as_local\s*=') {
-            throw 'the MTR manifest already sets *_as_local; merge by hand'
+        # Register-as-local codegen: guest CR, CTR, XER and the non-volatile registers become C++
+        # locals instead of PPCContext fields, and the register save/restore helper calls disappear
+        # (XenonRecomp's README; UnleashedRecomp's SWA.toml sets all eight options). Arguments and r1
+        # stay in ctx. Measured on the race: -17.9 % frame time.
+        # reserved_as_local: the lwarx/ldarx reservation becomes a local. Every function in this game
+        # with a load-reserve also has its store-conditional (167 functions, none split), so the
+        # reservation never has to cross a call.
+        # The other three stay off, each because this game's code depends on what it removes:
+        #   skip_lr: two blrl sites branch to ctx.lr, and MTR's garage collision patch reads ctx.lr
+        #     to identify its caller.
+        #   skip_msr: about 195 mtmsrd r13 ... mtmsrd interrupt-off regions guard shared data; they
+        #     are the REX_ENTER/LEAVE_GLOBAL_LOCK pairs.
+        #   non_argument_as_local: about 845 exception-handler funclets take their frame pointer in
+        #     r12 (addi r31,r12,-N at entry), and some tail-branch chunks take r11 from the function
+        #     that branched to them; as locals those values would be lost.
+        if ($content -match '(?m)^\s*((cr|ctr|xer|non_volatile|non_argument|reserved)_as_local|skip_lr|skip_msr)\s*=') {
+            throw 'the MTR manifest already sets codegen register options; merge by hand'
         }
-        $locals = "cr_as_local = true`nctr_as_local = true`nxer_as_local = true`nnon_volatile_as_local = true`n"
+        $locals = "cr_as_local = true`nctr_as_local = true`nxer_as_local = true`nnon_volatile_as_local = true`nreserved_as_local = true`n"
         $entry = [regex]::Match($content, '(?m)^\[entrypoint\]\r?\n')
         if (-not $entry.Success) { throw 'pgr4_recompiled_manifest.toml: [entrypoint] not found' }
         $content = $content.Insert($entry.Index + $entry.Length, $locals)

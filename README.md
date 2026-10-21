@@ -280,10 +280,48 @@ It also has a texture untiling harness and an offline shader translation test.
 - Run on a Steam Deck, and measure a GPU-limited case.
 - Cut the remaining race-start work: first vertex copies, untiling the first submit waits for.
 
+## Tooling and agents
+
+The renderer was built and tuned by coding agents, several at a time, driving one Windows PC.
+The tooling for that is in this repository:
+
+- `tools/lab/`: the `lab` CLI (Bun). `lab pgr4 <verb>` syncs this checkout (or a commit) to a
+  build tree on the Windows host, builds it, runs the scripted race, and reports profiled
+  stages, frame time, a paired A/B verdict (`ab`), the image check against the Xenos plugin
+  (`oracle`, `diff`) or a demo clip. `lab pgr4 help` lists the verbs.
+- `lab/` and `run/`: the PowerShell scripts those verbs run on the host: a FIFO queue and lock
+  so only one game runs at a time, GUI launches in the desktop session, the input player and
+  the St Petersburg route.
+- `proton/`: the same race under Proton on Linux.
+- `docs/`: how the renderer works, the measuring workflow, the perf plan, research notes, and
+  setup for Windows (`docs/running-on-windows.md`) and Proton (`docs/proton.md`).
+- `AGENTS.md`, `skills/pgr4-native/` and `prompts/`: what an agent reads first, the renderer
+  performance rules taken from other Xbox 360 ports, and the briefs used to run a wave of
+  agents with one integrator.
+
+To use it you need [Bun](https://bun.sh) 1.1 or newer on the machine you drive from, and
+[fleet](https://github.com/safzanpirani/fleet) with your Windows PC added as a host (OpenSSH
+server, PowerShell 7). Then:
+
+```sh
+bun install
+export RECOMP_HOST=<fleet host name of the Windows PC>
+bun tools/lab/cli.ts pgr4 help
+bun tools/lab/cli.ts pgr4 scripts      # install lab/ and run/ on the host
+```
+
+The scripts assume `C:\recomp` on the host (`builds\pgr4`, `logs`, `locks`); a junction works if
+C: is small. Give each build tree an inbound firewall rule before its first run, or the "allow
+access" prompt steals focus from the input player
+(`New-NetFirewallRule -Direction Inbound -Action Block -Program <tree>\run\runtime\pgr4_recompiled.exe -DisplayName pgr4-<Name>`).
+Stay logged in to the desktop and run as that user: games start in the desktop session through
+a scheduled task. The host also needs Python 3 with numpy and Pillow, and ffmpeg with NVENC for
+demo clips.
+
 ## About this repository
 
-The code is developed in a private repository and published here automatically. History starts
-at the first public commit. Code comments sometimes point to development notes that are not
-published.
+The code, tooling and docs are developed in a private repository and published here
+automatically. History starts at the first public commit. Code comments and docs sometimes
+point to development notes that are not published.
 
 Third-party notices: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

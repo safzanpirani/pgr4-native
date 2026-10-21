@@ -1,5 +1,5 @@
 # Starts or stops the native-renderer checkout (build.ps1) in the interactive desktop session
-# through a non-elevated scheduled task (README.md), and drives it.
+# through a non-elevated scheduled task (docs/running-on-windows.md), and drives it.
 #
 #   pwsh -NoProfile -File run.ps1 -Action start [-Tag menu] [-Native]  # logs: C:\recomp\logs\pgr4-native-<tag>-*
 #   pwsh -NoProfile -File run.ps1 -Action ctl -Command "trace menu 1"  # also: "skip draw", "skip none", "tap off"

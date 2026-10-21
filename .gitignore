@@ -4,3 +4,6 @@ generated/
 *.log
 *.csv
 __pycache__/
+# lab CLI: dependencies and files copied back from the build host
+node_modules/
+.cache/

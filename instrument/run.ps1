@@ -1,5 +1,5 @@
 # Starts or stops the instrumented MTR-PGR4 build (see build.ps1) in the interactive desktop
-# session through a non-elevated scheduled task (README.md).
+# session through a non-elevated scheduled task (docs/running-on-windows.md).
 #
 #   pwsh -NoProfile -File run.ps1 -Action start [-Tag menu]   # logs to C:\recomp\logs\pgr4-drawcount-<tag>-*.log
 #   pwsh -NoProfile -File run.ps1 -Action stop                # ends the pgr4_recompiled.exe this build started

@@ -9,7 +9,7 @@
   },
   "scripts": {
     "lab": "bun tools/lab/cli.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "bun check --no-script"
   },
   "engines": {
     "bun": ">=1.1"
